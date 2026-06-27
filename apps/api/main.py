@@ -383,14 +383,20 @@ async def predict_match_stream(request: MatchPredictionRequest):
             "agent_findings": [],
         }
 
+        _ALL_NODES = _ANALYSIS_NODES | _ALL_AGENT_NODES | {"supervisor", "report_node"}
+
         prediction_sent = False
 
         async for event in graph.astream_events(initial_state, version="v2"):
             kind = event.get("event", "")
             name = event.get("name", "")
 
-            # After supervisor finishes, emit the deterministic prediction event.
-            if kind == "on_chain_end" and name == "supervisor" and not prediction_sent:
+            # Node start → graph visualization
+            if kind == "on_chain_start" and name in _ALL_NODES:
+                yield _sse("node_start", {"node": name})
+
+            # Supervisor end → prediction data + node_end
+            elif kind == "on_chain_end" and name == "supervisor" and not prediction_sent:
                 output = event.get("data", {}).get("output", {})
                 yield _sse("prediction", {
                     "probabilities": output.get("probabilities", {}),
@@ -401,8 +407,9 @@ async def predict_match_stream(request: MatchPredictionRequest):
                     "shap_values": output.get("shap_values", {}),
                 })
                 prediction_sent = True
+                yield _sse("node_end", {"node": "supervisor"})
 
-            # Each analysis/debate/risk node completion → emit reasoning event.
+            # Analysis/debate/risk node end → reasoning trace + node_end
             elif kind == "on_chain_end" and name in _ALL_AGENT_NODES:
                 output = event.get("data", {}).get("output", {})
                 new_findings = output.get("agent_findings", [])
@@ -413,7 +420,6 @@ async def predict_match_stream(request: MatchPredictionRequest):
                         af = AgentFinding(**finding)
                     except Exception:
                         continue
-                    # Build reasoning trace deterministically (LLM already ran inside the node).
                     steps = deterministic_steps(af)
                     from worldcup_forecast.schemas import AgentReasoning
                     reasoning = AgentReasoning(
@@ -427,12 +433,14 @@ async def predict_match_stream(request: MatchPredictionRequest):
                         powered_by="llm" if llm_settings.enabled and llm_settings.api_key else "deterministic",
                     )
                     yield _sse("reasoning", reasoning.model_dump())
+                yield _sse("node_end", {"node": name})
 
-            # Report node done → emit report + done.
+            # Report node end → report + done + node_end
             elif kind == "on_chain_end" and name == "report_node":
                 output = event.get("data", {}).get("output", {})
                 report_id = output.get("report_id", str(uuid.uuid4()))
                 explanation = output.get("explanation", "")
+                yield _sse("node_end", {"node": "report_node"})
                 yield _sse("report", {"explanation": explanation, "report_id": report_id})
                 yield _sse("done", {"report_id": report_id})
 
@@ -666,8 +674,26 @@ def latest_standings():
     return store.get_group_standings()
 
 
-@app.post("/api/backtest/run", response_model=BacktestRunResult)
-def run_backtest(request: BacktestRunRequest | None = None):
+def _backtest_template_explanation(result: BacktestRunResult) -> str:
+    if not result.metrics:
+        return "回测未找到历史比赛记录，请先导入数据后再运行。"
+    years = "/".join(str(m.tournament_year) for m in result.metrics)
+    avg_brier = sum(m.brier for m in result.metrics) / len(result.metrics)
+    avg_baseline = sum(m.baseline_brier for m in result.metrics) / len(result.metrics)
+    avg_roi = sum(m.roi for m in result.metrics) / len(result.metrics)
+    avg_dd = sum(m.max_drawdown for m in result.metrics) / len(result.metrics)
+    better = "优于" if avg_brier < avg_baseline else "不及"
+    roi_str = f"+{avg_roi*100:.1f}%" if avg_roi >= 0 else f"{avg_roi*100:.1f}%"
+    return (
+        f"模型在 {years} 届世界杯回测中，平均 Brier 分 {avg_brier:.3f}（越低越准），"
+        f"{better}随机基准 {avg_baseline:.3f}。"
+        f"模拟投注 ROI 为 {roi_str}，最大回撤 {avg_dd*100:.1f}%。"
+        f"{'整体预测能力高于随机猜测，模型有效。' if avg_brier < avg_baseline else '模型尚未显著超越基准，可尝试调整参数或补充更多数据。'}"
+    )
+
+
+@app.post("/api/backtest/run")
+async def run_backtest(request: BacktestRunRequest | None = None):
     if store.match_count() == 0:
         try:
             data_result = WorldCupDataDownloader().download_and_prepare(force=True)
@@ -676,7 +702,20 @@ def run_backtest(request: BacktestRunRequest | None = None):
         HistoricalIngestor(store).load_csv(Path(data_result.output_path))
         EloUpdater(store).update_from_results()
     runner = BacktestRunner(store)
-    return runner.run(params=request or BacktestRunRequest())
+    result = runner.run(params=request or BacktestRunRequest())
+
+    explanation = _backtest_template_explanation(result)
+    llm_settings = store.get_llm_settings()
+    if llm_settings.enabled and llm_settings.api_key:
+        try:
+            explanation = await OpenAICompatibleClient(llm_settings).complete(
+                "你是足球数据分析师，请用通俗中文向普通用户解释这次回测结果，说明模型是否有效、投注表现如何，不超过120字，不要出现专业术语缩写。",
+                f"回测结果：{result.model_dump_json()}",
+            )
+        except Exception:
+            pass
+
+    return {**result.model_dump(), "explanation": explanation}
 
 
 @app.get("/api/backtest/results")

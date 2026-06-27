@@ -1086,3 +1086,39 @@ th {
 .today-rec {
   color: var(--primary);
 }
+
+/* ── GraphView ─────────────────────────────────── */
+.react-flow__controls {
+  bottom: 8px;
+  left: 8px;
+}
+
+/* ── SHAP empty state ──────────────────────────── */
+.shap-empty {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.shap-empty h4 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.shap-empty p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+/* ── Backtest explanation ──────────────────────── */
+.backtest-explanation {
+  padding: 14px 18px;
+  background: rgba(33, 104, 105, 0.07);
+  border-left: 3px solid var(--primary);
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1.7;
+}

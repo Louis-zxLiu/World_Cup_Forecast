@@ -37,6 +37,8 @@ export type StreamHandlers = {
   onReasoning?: (data: AgentReasoning) => void;
   onReport?: (data: { explanation: string; report_id: string }) => void;
   onDone?: (data: { report_id: string }) => void;
+  onNodeStart?: (data: { node: string }) => void;
+  onNodeEnd?: (data: { node: string }) => void;
   onError?: (error: Error) => void;
 };
 
@@ -75,6 +77,8 @@ export async function streamPrediction(
     else if (event === "reasoning") handlers.onReasoning?.(parsed as AgentReasoning);
     else if (event === "report") handlers.onReport?.(parsed);
     else if (event === "done") handlers.onDone?.(parsed);
+    else if (event === "node_start") handlers.onNodeStart?.(parsed);
+    else if (event === "node_end") handlers.onNodeEnd?.(parsed);
   };
 
   while (true) {
@@ -260,6 +264,7 @@ export type BacktestRunResult = {
   run_at: string;
   metrics: BacktestMetrics[];
   params: BacktestRunRequest;
+  explanation?: string;
 };
 
 export type BacktestRunRequest = {

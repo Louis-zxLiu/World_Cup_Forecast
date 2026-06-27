@@ -80,7 +80,9 @@ def test_predict_match_stream_emits_reasoning():
             for line in response.iter_lines()
             if line.startswith("event:")
         ]
-    assert events[0] == "prediction"
+    assert "prediction" in events
     assert "reasoning" in events
+    assert "node_start" in events
+    assert "node_end" in events
     assert events[-1] == "done"
 

@@ -11,6 +11,7 @@ import {
   YAxis,
 } from "recharts";
 import { api, type BacktestRunResult, type WorldCupDataImportResult } from "../api";
+import { MarkdownView } from "./MarkdownView";
 
 export function Backtest() {
   const [loading, setLoading] = useState(false);
@@ -147,6 +148,13 @@ export function Backtest() {
 
       {result && (
         <>
+          {result.explanation && (
+            <section className="card">
+              <div className="backtest-explanation">
+                <MarkdownView content={result.explanation} />
+              </div>
+            </section>
+          )}
           <section className="card">
             <div className="page-heading compact">
               <div>

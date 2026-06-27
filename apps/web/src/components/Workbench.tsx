@@ -13,6 +13,7 @@ import {
 import { api, streamPrediction, type AgentReasoning, type LiveMatch, type Prediction } from "../api";
 import { MarkdownView } from "./MarkdownView";
 import { ReasoningTrace } from "./ReasoningTrace";
+import { GraphView, type NodeStatus } from "./GraphView";
 
 type Props = {
   liveMatches: LiveMatch[];
@@ -98,6 +99,7 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
   const [prediction, setPrediction] = useState<Prediction | null>(null);
   const [reasonings, setReasonings] = useState<AgentReasoning[]>([]);
   const [streaming, setStreaming] = useState(false);
+  const [nodeStates, setNodeStates] = useState<Record<string, NodeStatus>>({});
   const [detailTab, setDetailTab] = useState<"reasoning" | "signals" | "agents" | "features">("reasoning");
 
   const home = selectedMatch?.home_team || homeTeam;
@@ -157,6 +159,7 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
     setStreaming(true);
     setReasonings([]);
     setPrediction(null);
+    setNodeStates({});
     setDetailTab("reasoning");
     const findings: AgentReasoning[] = [];
     try {
@@ -203,6 +206,12 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
                 : prev,
             );
           },
+          onNodeStart: (data) => {
+            setNodeStates((prev) => ({ ...prev, [data.node]: "running" }));
+          },
+          onNodeEnd: (data) => {
+            setNodeStates((prev) => ({ ...prev, [data.node]: "done" }));
+          },
         },
       );
       onMessage("预测完成。可在“推理过程”查看每位智能体的逐步推理。", "info");
@@ -219,6 +228,22 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
     setHomeTeam(match.home_team);
     setAwayTeam(match.away_team);
     setPrediction(null);
+  }
+
+  async function trainModel() {
+    setLoading("train");
+    try {
+      const r = await api<{ status: string; model_version: string }>("/api/models/train", { method: "POST" });
+      if (r.status === "ok") {
+        onMessage(`XGBoost 训练完成：${r.model_version}。下次预测将自动使用此模型并显示 SHAP 特征贡献。`, "info");
+      } else {
+        onMessage(`模型跳过训练：${(r as any).reason ?? "数据不足"}`, "info");
+      }
+    } catch (error) {
+      onMessage(error instanceof Error ? error.message : "模型训练失败", "error");
+    } finally {
+      setLoading("");
+    }
   }
 
   function updateParam(key: keyof ResearchParams, value: number) {
@@ -454,6 +479,16 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
         </section>
       </div>
 
+      {(streaming || (prediction && Object.keys(nodeStates).length > 0)) && (
+        <section className="card">
+          <div className="card-title">
+            <Activity size={20} />
+            智能体执行图
+          </div>
+          <GraphView nodeStates={nodeStates} />
+        </section>
+      )}
+
       {prediction && (
         <section className="card details-card">
           <div className="segmented">
@@ -536,7 +571,23 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
                 </ResponsiveContainer>
               </div>
             ) : (
-              <div className="empty">训练 XGBoost 模型后，这里会显示 SHAP 特征贡献。</div>
+              <div className="shap-empty">
+                <h4>SHAP 特征贡献（XGBoost 模型）</h4>
+                <p>
+                  SHAP 值表示每个因素对本场预测的推动方向：<strong>正值（绿色）</strong>提升主队胜率，<strong>负值（红色）</strong>降低主队胜率。
+                </p>
+                <p>
+                  模型使用 8 个特征：主客队 Elo 分、Elo 差值、主场优势、近 5 场平均进/失球数（主客队各 2 项）。
+                  XGBoost 在历史回测中比纯 Elo/泊松模型更准，需要先用历史比赛数据训练一次。
+                </p>
+                <button
+                  className="btn btn-ghost"
+                  onClick={trainModel}
+                  disabled={loading === "train"}
+                >
+                  {loading === "train" ? "训练中…" : "一键训练 XGBoost 模型"}
+                </button>
+              </div>
             )
           )}
         </section>

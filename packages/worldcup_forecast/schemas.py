@@ -260,6 +260,7 @@ class BacktestRunResult(BaseModel):
     run_at: datetime
     metrics: list[BacktestMetrics]
     params: BacktestRunRequest = Field(default_factory=BacktestRunRequest)
+    explanation: str = ""
 
 
 class TournamentBracket(BaseModel):
