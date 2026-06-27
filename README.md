@@ -1,15 +1,15 @@
 # World Cup Forecast
 
-> 面向足球赛事的可解释多智能体预测平台 —— 把 Elo/泊松统计模型、七个专项 AI 智能体、实时赔率抓取和 LLM 推理链整合成一个可本地部署的一体化工具。
+> 面向足球赛事的可解释多智能体预测平台 —— 把 Elo/泊松统计模型、基于 LangGraph 的真·多智能体编排、实时赔率抓取和 LLM 推理链整合成一个可本地部署的一体化工具。
 
 适合：对足球量化分析感兴趣的开发者、体育数据研究者、以及想直观看到"AI 如何一步步推理一场比赛"的技术爱好者。
 
 ## ✨ 项目亮点
 
-- **七个专项智能体并发推理**：实力分析（Elo 差值）、近期状态（近10场 PPG/净胜球）、新闻舆情（伤停/阵容信号）、赔率市场（edge 计算）、多空辩论（基于概率/edge/Elo/PPG 的数据驱动论点）、风险管理，结果通过 SSE 流式推送到前端
+- **LangGraph 真·多智能体**：StateGraph 编排七个专项智能体，4 个分析节点（实力/状态/新闻/赔率）通过 Send API 并行 fan-out，辩论双方真正看到对方论点再反驳，图结构可视化
+- **ReAct 工具循环**：配置 LLM key 后，每个智能体获得工具箱（query_elo / get_recent_form / search_news / get_odds），LLM 自主决定调哪些工具、调几次，再给出结论；无 key 自动降级为确定性逻辑
 - **真实数据驱动**：接入 [martj42/football-data](https://github.com/martj42/international_results) 全量 4.9 万场国际比赛，基于赛事级别 K 因子和进球差倍率计算 336 支球队的真实 Elo
 - **统计精度更高**：Dixon-Coles 双泊松模型（rho=-0.13），回测 Brier score 从 0.689 降至 0.584（降幅 15%）
-- **LLM 推理链可见**：每个智能体的分析步骤（观察/分析/结论）以结构化 JSON 流式返回，无 LLM key 自动降级为规则推理
 - **国内可用的联网搜索**：支持博查 Bocha / 智谱 Web Search，与 LLM 解耦，新闻舆情智能体失败时诚实报告而非假装中性
 - **傻瓜式首页**：自然语言输入（"巴西 vs 阿根廷"）、一键今日推荐、Kelly 仓位建议，不需要了解底层参数
 
@@ -79,7 +79,7 @@ npm run dev
 ```
 World_Cup_Forecast/
 ├── apps/
-│   ├── api/main.py          # FastAPI 后端，SSE 流式端点
+│   ├── api/main.py          # FastAPI 后端，LangGraph 集成 + SSE 流式端点
 │   └── web/src/             # React + TypeScript 前端
 │       └── components/
 │           ├── Home.tsx         # 首页（自然语言 + 今日推荐）
@@ -87,15 +87,20 @@ World_Cup_Forecast/
 │           ├── ReasoningTrace.tsx  # 智能体推理追踪卡片
 │           └── Settings.tsx     # 系统设置
 ├── packages/worldcup_forecast/
-│   ├── agents.py            # 七个专项智能体
+│   ├── graph/               # LangGraph 多智能体编排层
+│   │   ├── state.py             # ForecastState TypedDict（共享状态）
+│   │   ├── tools.py             # @tool 工具函数（query_elo / get_recent_form / search_news / get_odds）
+│   │   ├── nodes.py             # 各节点（supervisor + 4个ReAct智能体 + debate + risk + report）
+│   │   └── graph.py             # build_forecast_graph() → CompiledGraph
+│   ├── agents.py            # 七个确定性智能体（LangGraph 降级路径）
 │   ├── modeling.py          # Elo + Dixon-Coles 双泊松模型
 │   ├── ingest.py            # 数据下载与 Elo 计算
-│   ├── reasoning.py         # LLM 结构化推理链
+│   ├── reasoning.py         # 确定性推理链（降级用）
 │   ├── search.py            # 可插拔联网搜索层
 │   ├── form.py              # 近期状态统计
 │   ├── storage.py           # DuckDB 数据层
 │   └── schemas.py           # Pydantic 数据模型
-├── tests/                   # pytest 测试套件（54 个用例）
+├── tests/                   # pytest 测试套件（69 个用例）
 └── start.bat                # Windows 一键启动
 ```
 

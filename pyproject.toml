@@ -24,7 +24,10 @@ dependencies = [
   "scikit-learn>=1.5.1",
   "shap>=0.46.0",
   "uvicorn[standard]>=0.30.5",
-  "xgboost>=2.1.1"
+  "xgboost>=2.1.1",
+  "langgraph>=0.3.0",
+  "langchain-openai>=0.3.0",
+  "langchain-core>=0.3.0"
 ]
 
 [project.optional-dependencies]

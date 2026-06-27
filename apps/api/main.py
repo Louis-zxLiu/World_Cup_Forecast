@@ -21,6 +21,7 @@ from worldcup_forecast.agents import (
 from worldcup_forecast.backtest import BacktestRunner
 from worldcup_forecast.config import get_config
 from worldcup_forecast.espn import ESPNProvider
+from worldcup_forecast.graph import build_forecast_graph
 from worldcup_forecast.ingest import (
     EloUpdater,
     HistoricalIngestor,
@@ -312,50 +313,47 @@ def train_model():
 
 @app.post("/api/predict/match", response_model=PredictionResult)
 async def predict_match(request: MatchPredictionRequest):
-    active = _active_model()
-    odds = store.find_match_odds(request.home_team, request.away_team)
-    distribution = active.predict_score_distribution(request)
-    shap_values: dict[str, float] = {}
-    if xgb_model._clf is not None:
-        shap_values = SHAPExplainer(xgb_model).top_features(
-            request.home_team, request.away_team, request.neutral_site
-        )
+    llm_settings = store.get_llm_settings()
+    search_settings = store.get_search_settings()
+    graph = build_forecast_graph(store, search_settings)
+    initial_state = {
+        "request": request.model_dump(),
+        "llm_settings": llm_settings.model_dump(),
+        "search_settings": search_settings.model_dump(),
+        "agent_findings": [],
+    }
+    final_state = await graph.ainvoke(initial_state)
+
+    from worldcup_forecast.schemas import (
+        AgentFinding, BetSignal, OutcomeProbability, OddsRecord,
+    )
+    probs = OutcomeProbability(**final_state["probabilities"])
+    signals = [BetSignal(**s) for s in final_state.get("bet_signals", [])]
+    findings = []
+    for f in final_state.get("agent_findings", []):
+        try:
+            findings.append(AgentFinding(**f))
+        except Exception:
+            pass
+    odds_raw = final_state.get("odds")
+    odds = OddsRecord(**odds_raw) if odds_raw else None
 
     result = PredictionResult(
         match=request,
-        probabilities=distribution.probabilities,
-        expected_score=(
-            round(distribution.expected_home_goals, 3),
-            round(distribution.expected_away_goals, 3),
-        ),
-        most_likely_score=distribution.most_likely_score,
+        probabilities=probs,
+        expected_score=final_state.get("expected_score", (1.3, 1.1)),
+        most_likely_score=final_state.get("most_likely_score", "1-1"),
         odds=odds,
-        bet_signals=build_bet_signals(request, distribution.probabilities, odds),
-        agent_findings=build_agent_findings(request, odds, store, store.get_search_settings()),
-        shap_values=shap_values,
-        explanation="",
+        bet_signals=signals,
+        agent_findings=findings,
+        shap_values=final_state.get("shap_values", {}),
+        explanation=final_state.get("explanation", ""),
     )
-    result.agent_findings.extend(BullBearDebateAgents().debate(result))
-    result.agent_findings.append(RiskManagerAgent().analyze(result))
-
-    llm_settings = store.get_llm_settings()
-    if llm_settings.enabled and llm_settings.api_key:
-        try:
-            prompt = (
-                "请用中文生成一份简洁、可解释、带风险提示的世界杯单场预测报告。"
-                f"数据如下：{result.model_dump_json()}"
-            )
-            result.explanation = await OpenAICompatibleClient(llm_settings).complete(
-                "你是谨慎的足球量化和投注风控分析师，不承诺稳赚。",
-                prompt,
-            )
-        except Exception:
-            result.explanation = template_explanation(result)
-    else:
-        result.explanation = template_explanation(result)
-
-    report_id = str(uuid.uuid4())
-    store.save_report(report_id, result.model_dump_json())
+    # report_node already persisted the report; only save if it somehow wasn't set.
+    report_id = final_state.get("report_id")
+    if not report_id:
+        report_id = str(uuid.uuid4())
+        store.save_report(report_id, result.model_dump_json())
     return result
 
 
@@ -365,89 +363,78 @@ def _sse(event: str, data: dict) -> str:
 
 @app.post("/api/predict/match/stream")
 async def predict_match_stream(request: MatchPredictionRequest):
-    """Stream the multi-agent prediction, exposing each agent's reasoning live.
+    """Stream the multi-agent prediction via LangGraph, exposing each agent's reasoning live.
 
-    Emits Server-Sent Events: ``prediction`` (probabilities + bet signals),
-    then one ``reasoning`` event per agent as its chain of thought is produced,
-    and finally a ``report`` event with the synthesized explanation.
+    Emits Server-Sent Events: ``prediction`` (after supervisor), one ``reasoning``
+    per agent node completion, then ``report`` and ``done``.
     """
+    # Node names that emit a reasoning SSE event when they complete.
+    _ANALYSIS_NODES = {"strength_node", "form_node", "news_node", "odds_node"}
+    _ALL_AGENT_NODES = _ANALYSIS_NODES | {"debate_node", "risk_node"}
 
     async def event_stream():
-        active = _active_model()
-        odds = store.find_match_odds(request.home_team, request.away_team)
-        distribution = active.predict_score_distribution(request)
-        shap_values: dict[str, float] = {}
-        if xgb_model._clf is not None:
-            shap_values = SHAPExplainer(xgb_model).top_features(
-                request.home_team, request.away_team, request.neutral_site
-            )
+        llm_settings = store.get_llm_settings()
+        search_settings = store.get_search_settings()
+        graph = build_forecast_graph(store, search_settings)
+        initial_state = {
+            "request": request.model_dump(),
+            "llm_settings": llm_settings.model_dump(),
+            "search_settings": search_settings.model_dump(),
+            "agent_findings": [],
+        }
 
-        result = PredictionResult(
-            match=request,
-            probabilities=distribution.probabilities,
-            expected_score=(
-                round(distribution.expected_home_goals, 3),
-                round(distribution.expected_away_goals, 3),
-            ),
-            most_likely_score=distribution.most_likely_score,
-            odds=odds,
-            bet_signals=build_bet_signals(request, distribution.probabilities, odds),
-            agent_findings=build_agent_findings(request, odds, store, store.get_search_settings()),
-            shap_values=shap_values,
-            explanation="",
-        )
-        result.agent_findings.extend(BullBearDebateAgents().debate(result))
-        result.agent_findings.append(RiskManagerAgent().analyze(result))
+        prediction_sent = False
 
-        yield _sse(
-            "prediction",
-            {
-                "probabilities": result.probabilities.model_dump(),
-                "expected_score": result.expected_score,
-                "most_likely_score": result.most_likely_score,
-                "bet_signals": [s.model_dump() for s in result.bet_signals],
-                "odds": result.odds.model_dump() if result.odds else None,
-                "shap_values": result.shap_values,
-            },
-        )
+        async for event in graph.astream_events(initial_state, version="v2"):
+            kind = event.get("event", "")
+            name = event.get("name", "")
 
-        settings = store.get_llm_settings()
-        # Launch every agent's reasoning concurrently so the slow LLM calls
-        # overlap, then stream them in their original order to keep the UI's
-        # progressive reveal intact. The final synthesized report is kicked off
-        # alongside the per-agent reasoning so it doesn't add latency at the end.
-        reasoning_tasks = [
-            asyncio.create_task(reason_for_finding(finding.agent, finding, request, settings))
-            for finding in result.agent_findings
-        ]
+            # After supervisor finishes, emit the deterministic prediction event.
+            if kind == "on_chain_end" and name == "supervisor" and not prediction_sent:
+                output = event.get("data", {}).get("output", {})
+                yield _sse("prediction", {
+                    "probabilities": output.get("probabilities", {}),
+                    "expected_score": output.get("expected_score", []),
+                    "most_likely_score": output.get("most_likely_score", ""),
+                    "bet_signals": output.get("bet_signals", []),
+                    "odds": output.get("odds"),
+                    "shap_values": output.get("shap_values", {}),
+                })
+                prediction_sent = True
 
-        async def _build_report() -> str:
-            if settings.enabled and settings.api_key:
-                try:
-                    prompt = (
-                        "请用中文生成一份简洁、可解释、带风险提示的世界杯单场预测报告。"
-                        f"数据如下：{result.model_dump_json()}"
+            # Each analysis/debate/risk node completion → emit reasoning event.
+            elif kind == "on_chain_end" and name in _ALL_AGENT_NODES:
+                output = event.get("data", {}).get("output", {})
+                new_findings = output.get("agent_findings", [])
+                for finding in new_findings:
+                    from worldcup_forecast.schemas import AgentFinding
+                    from worldcup_forecast.reasoning import deterministic_steps
+                    try:
+                        af = AgentFinding(**finding)
+                    except Exception:
+                        continue
+                    # Build reasoning trace deterministically (LLM already ran inside the node).
+                    steps = deterministic_steps(af)
+                    from worldcup_forecast.schemas import AgentReasoning
+                    reasoning = AgentReasoning(
+                        agent=af.agent,
+                        confidence=af.confidence,
+                        signal=af.signal,
+                        steps=steps,
+                        rationale=af.rationale,
+                        sources=af.sources,
+                        metrics=af.metrics,
+                        powered_by="llm" if llm_settings.enabled and llm_settings.api_key else "deterministic",
                     )
-                    return await OpenAICompatibleClient(settings).complete(
-                        "你是谨慎的足球量化和投注风控分析师，不承诺稳赚。",
-                        prompt,
-                    )
-                except Exception:
-                    return template_explanation(result)
-            return template_explanation(result)
+                    yield _sse("reasoning", reasoning.model_dump())
 
-        report_task = asyncio.create_task(_build_report())
-
-        for task in reasoning_tasks:
-            reasoning = await task
-            yield _sse("reasoning", reasoning.model_dump())
-
-        result.explanation = await report_task
-
-        report_id = str(uuid.uuid4())
-        store.save_report(report_id, result.model_dump_json())
-        yield _sse("report", {"explanation": result.explanation, "report_id": report_id})
-        yield _sse("done", {"report_id": report_id})
+            # Report node done → emit report + done.
+            elif kind == "on_chain_end" and name == "report_node":
+                output = event.get("data", {}).get("output", {})
+                report_id = output.get("report_id", str(uuid.uuid4()))
+                explanation = output.get("explanation", "")
+                yield _sse("report", {"explanation": explanation, "report_id": report_id})
+                yield _sse("done", {"report_id": report_id})
 
     return StreamingResponse(
         event_stream(),
