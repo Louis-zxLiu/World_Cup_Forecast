@@ -142,10 +142,25 @@ class NewsSentimentAgent:
         self.search_settings = search_settings
 
     def analyze(self, request: MatchPredictionRequest) -> AgentFinding:
-        # Prefer the configured web-search layer (reachable from mainland China);
-        # fall back to the legacy RSS provider only if search is unavailable.
+        # Use configured web-search layer when enabled.
         if self.search_settings and self.search_settings.enabled and self.search_settings.api_key:
             return self._analyze_via_search(request)
+        # If search is explicitly disabled or not configured, report honestly.
+        if self.search_settings is not None and (
+            not self.search_settings.enabled or self.search_settings.provider == "none"
+        ):
+            return AgentFinding(
+                agent=self.name,
+                confidence=0.3,
+                signal="neutral",
+                rationale=(
+                    "未启用联网搜索源，无法获取伤停/阵容新闻，本维度暂不调整概率。"
+                    "可在系统设置里配置并启用联网搜索 API（博查/智谱）。"
+                ),
+                sources=[],
+                metrics={"search_ok": False},
+            )
+        # Legacy RSS fallback when no search_settings provided at all.
         return self._analyze_via_rss(request)
 
     def _analyze_via_search(self, request: MatchPredictionRequest) -> AgentFinding:
@@ -260,29 +275,99 @@ class OddsMarketAgent:
 class BullBearDebateAgents:
     def debate(self, result: PredictionResult) -> list[AgentFinding]:
         best_signal = result.bet_signals[0] if result.bet_signals else None
-        if not best_signal:
-            return []
+        probs = result.probabilities
+        home = result.match.home_team
+        away = result.match.away_team
+
+        # Pull supporting metrics from sibling agents already in the result.
+        strength_metrics: dict = next(
+            (f.metrics for f in result.agent_findings if f.metrics and "elo_diff" in f.metrics),
+            {},
+        )
+        form_metrics: dict = next(
+            (f.metrics for f in result.agent_findings if f.metrics and "ppg_gap" in f.metrics),
+            {},
+        )
+
+        # Base metrics shared by both sides.
+        base: dict = {
+            "home_win_prob": round(probs.home_win, 3),
+            "draw_prob": round(probs.draw, 3),
+            "away_win_prob": round(probs.away_win, 3),
+        }
+        if strength_metrics:
+            base["elo_diff"] = strength_metrics.get("elo_diff", 0)
+        if form_metrics:
+            base["ppg_gap"] = form_metrics.get("ppg_gap", 0)
+
+        bull_metrics = dict(base)
+        bear_metrics = dict(base)
+
+        if best_signal:
+            bull_metrics.update({
+                "best_outcome": best_signal.outcome,
+                "model_prob": round(best_signal.model_probability, 3),
+                "kelly_fraction": round(best_signal.kelly_fraction, 3),
+                "stake": round(best_signal.stake, 2),
+            })
+            bear_metrics.update({
+                "best_outcome": best_signal.outcome,
+                "model_prob": round(best_signal.model_probability, 3),
+            })
+            if best_signal.edge is not None:
+                bull_metrics["edge"] = round(best_signal.edge, 3)
+                bear_metrics["edge"] = round(best_signal.edge, 3)
+            if best_signal.market_probability is not None:
+                bear_metrics["market_prob"] = round(best_signal.market_probability, 3)
+
+        # Build data-driven rationale strings.
+        if best_signal:
+            edge_str = f"，edge {best_signal.edge:.1%}" if best_signal.edge is not None else ""
+            bull_rationale = (
+                f"正方：{best_signal.outcome} 模型概率 {best_signal.model_probability:.1%}{edge_str}，"
+                f"Kelly 建议仓位 {best_signal.kelly_fraction:.2f}（{best_signal.stake:.2f} 元）。"
+                f"主队胜率 {probs.home_win:.1%} / 平 {probs.draw:.1%} / 客队 {probs.away_win:.1%}。"
+            )
+        else:
+            bull_rationale = (
+                f"正方：{home} 主场胜率 {probs.home_win:.1%}，平局 {probs.draw:.1%}，"
+                f"{away} 获胜 {probs.away_win:.1%}。无达标价值投注信号，可小仓观察。"
+            )
+
+        if best_signal and best_signal.edge is not None:
+            if best_signal.market_probability is not None:
+                bear_rationale = (
+                    f"反方：市场隐含概率 {best_signal.market_probability:.1%} vs 模型 "
+                    f"{best_signal.model_probability:.1%}，差异 {best_signal.edge:.1%}；"
+                    "赛前阵容/伤停信息可能未充分反映，建议仓位保守。"
+                )
+            else:
+                bear_rationale = (
+                    f"反方：模型 edge {best_signal.edge:.1%}，但缺少赔率数据校验，"
+                    "阵容/伤停信号尚未确认，任何投注建议都应进行仓位折扣。"
+                )
+        else:
+            bear_rationale = (
+                f"反方：三方概率 {home} {probs.home_win:.1%} / 平 {probs.draw:.1%} / "
+                f"{away} {probs.away_win:.1%}，无赔率数据时 edge 可信度下降，建议观望。"
+            )
+
         return [
             AgentFinding(
                 agent="正方研究员",
                 confidence=0.6,
                 signal="positive",
-                rationale=(
-                    f"正方：{best_signal.outcome} 的模型概率为 "
-                    f"{best_signal.model_probability:.1%}。若 edge 为正且赔率稳定，"
-                    "可以按风控建议小仓位参与。"
-                ),
+                rationale=bull_rationale,
                 sources=["internal:model_probability", "internal:odds_edge"],
+                metrics=bull_metrics,
             ),
             AgentFinding(
                 agent="反方研究员",
                 confidence=0.65,
                 signal="negative",
-                rationale=(
-                    "反方：当前模型仍需更多历史数据、临场阵容和新闻伤停校验，"
-                    "任何投注建议都应进行仓位折扣。"
-                ),
+                rationale=bear_rationale,
                 sources=["internal:model_risk"],
+                metrics=bear_metrics,
             ),
         ]
 
