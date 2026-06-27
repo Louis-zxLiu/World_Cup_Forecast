@@ -84,6 +84,11 @@ class ScoreDistribution:
     expected_home_goals: float
     expected_away_goals: float
     most_likely_score: str
+    score_matrix: dict[str, float] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.score_matrix is None:
+            self.score_matrix = {}
 
 
 class BaselineForecastModel:
@@ -121,6 +126,7 @@ class BaselineForecastModel:
         home_win = draw = away_win = 0.0
         best_score = "0-0"
         best_prob = 0.0
+        score_matrix: dict[str, float] = {}
         for home_goals in range(7):
             for away_goals in range(7):
                 probability = (
@@ -128,6 +134,7 @@ class BaselineForecastModel:
                     * poisson_probability(away_goal_rate, away_goals)
                     * dixon_coles_tau(home_goals, away_goals, home_goal_rate, away_goal_rate)
                 )
+                score_matrix[f"{home_goals}-{away_goals}"] = round(probability, 6)
                 if probability > best_prob:
                     best_prob = probability
                     best_score = f"{home_goals}-{away_goals}"
@@ -145,6 +152,7 @@ class BaselineForecastModel:
             expected_home_goals=home_goal_rate,
             expected_away_goals=away_goal_rate,
             most_likely_score=best_score,
+            score_matrix=score_matrix,
         )
 
 

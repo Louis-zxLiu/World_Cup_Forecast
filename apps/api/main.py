@@ -519,11 +519,18 @@ def _quick_prediction(request: MatchPredictionRequest) -> PredictionResult:
         bet_signals=build_bet_signals(request, distribution.probabilities, odds),
         agent_findings=build_agent_findings(request, odds, store),
         explanation="",
+        score_matrix=distribution.score_matrix,
     )
     result.agent_findings.extend(BullBearDebateAgents().debate(result))
     result.agent_findings.append(RiskManagerAgent().analyze(result))
     result.explanation = template_explanation(result)
     return result
+
+
+@app.post("/api/predict/match/quick", response_model=PredictionResult)
+def predict_match_quick(request: MatchPredictionRequest):
+    """Fast deterministic prediction (no LLM, no LangGraph). For batch/programmatic use."""
+    return _quick_prediction(request)
 
 
 @app.get("/api/predict/today")

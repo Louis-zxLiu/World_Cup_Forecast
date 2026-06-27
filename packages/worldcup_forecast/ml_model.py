@@ -158,6 +158,7 @@ class XGBoostForecaster:
             expected_home_goals=baseline.expected_home_goals,
             expected_away_goals=baseline.expected_away_goals,
             most_likely_score=baseline.most_likely_score,
+            score_matrix=baseline.score_matrix,
         )
 
 

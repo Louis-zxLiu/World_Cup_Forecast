@@ -149,6 +149,7 @@ class PredictionResult(BaseModel):
     agent_findings: list[AgentFinding]
     explanation: str
     shap_values: dict[str, float] = Field(default_factory=dict)
+    score_matrix: dict[str, float] = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
