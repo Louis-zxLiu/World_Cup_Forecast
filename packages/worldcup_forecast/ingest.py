@@ -8,17 +8,38 @@ from typing import Any
 
 import httpx
 
-from .modeling import BASE_ELO
+from .modeling import BASE_ELO, NEUTRAL_ELO
 from .schemas import WorldCupDataImportResult
 from .storage import ForecastStore
 
 DEFAULT_CSV = Path("data/wc_results.csv")
+DEFAULT_INTL_CSV = Path("data/intl_results.csv")
 RAW_SOURCE_DIR = Path("data/raw/worldcup_sources")
 
 WORLD_CUP_MATCH_SOURCE_URLS = [
     "https://cdn.jsdelivr.net/gh/jfjelstul/worldcup@master/data-csv/matches.csv",
     "https://raw.githubusercontent.com/jfjelstul/worldcup/master/data-csv/matches.csv",
 ]
+
+# Full archive of international men's A-team matches since 1872 (~49k rows).
+# Used to build realistic Elo ratings and recent form for *every* national team,
+# not just the dozen that appear frequently at World Cups.
+INTERNATIONAL_RESULTS_SOURCE_URLS = [
+    "https://cdn.jsdelivr.net/gh/martj42/international_results@master/results.csv",
+    "https://raw.githubusercontent.com/martj42/international_results/master/results.csv",
+]
+
+# Substrings that identify a senior men's World Cup *finals* match (not qualifiers).
+WORLD_CUP_TOURNAMENT_MARKERS = ("fifa world cup", "men's world cup")
+
+
+def is_world_cup_finals(tournament: str) -> bool:
+    """True for World Cup finals matches, excluding qualification rounds."""
+    name = (tournament or "").lower()
+    if "qualif" in name:
+        return False
+    return any(marker in name for marker in WORLD_CUP_TOURNAMENT_MARKERS)
+
 
 K_FACTORS: dict[str, int] = {
     "Final": 60,
@@ -36,6 +57,52 @@ K_FACTORS: dict[str, int] = {
     "Group H": 50,
 }
 HOME_ADVANTAGE = 45
+
+
+# Tournament-importance weight (World Football Elo style). Friendlies move
+# ratings little; World Cup finals move them a lot. Matched by case-insensitive
+# substring against the ``tournament`` field of international results.
+TOURNAMENT_IMPORTANCE: list[tuple[str, int]] = [
+    ("fifa world cup", 60),
+    ("men's world cup", 60),
+    ("uefa euro", 50),
+    ("copa am", 50),  # Copa América
+    ("african cup of nations", 50),
+    ("afc asian cup", 50),
+    ("confederations cup", 45),
+    ("nations league", 45),
+    ("gold cup", 40),
+    ("qualif", 40),  # any qualification campaign
+]
+DEFAULT_IMPORTANCE = 30  # friendlies and minor tournaments
+
+
+def importance_for(tournament: str) -> int:
+    """Map a tournament name to its Elo K-factor (importance weight)."""
+    name = (tournament or "").lower()
+    # Qualification matches rank below their parent competition.
+    if "qualif" in name:
+        return 40
+    for marker, weight in TOURNAMENT_IMPORTANCE:
+        if marker in name:
+            return weight
+    return DEFAULT_IMPORTANCE
+
+
+def _goal_difference_multiplier(home_score: int, away_score: int) -> float:
+    """World Football Elo goal-difference weighting.
+
+    A one-goal win counts fully; larger margins amplify the rating change with
+    diminishing returns, so blowouts matter more than narrow wins but not
+    without bound.
+    """
+    margin = abs(home_score - away_score)
+    if margin <= 1:
+        return 1.0
+    if margin == 2:
+        return 1.5
+    return (11 + margin) / 8.0
+
 
 
 def _pick(raw: dict[str, str], *keys: str) -> str:
@@ -204,6 +271,7 @@ def _elo_update(
     away_score: int,
     k: int,
     neutral: bool,
+    use_goal_difference: bool = False,
 ) -> tuple[float, float]:
     adj_home = elo_home + (0 if neutral else HOME_ADVANTAGE)
     exp_home = _elo_expected(adj_home, elo_away)
@@ -213,7 +281,10 @@ def _elo_update(
         result = 0.5
     else:
         result = 0.0
-    delta = k * (result - exp_home)
+    effective_k = k
+    if use_goal_difference:
+        effective_k = k * _goal_difference_multiplier(home_score, away_score)
+    delta = effective_k * (result - exp_home)
     return elo_home + delta, elo_away - delta
 
 
@@ -244,17 +315,125 @@ class HistoricalIngestor:
         return self.store.insert_match_results(rows)
 
 
+class InternationalResultsDownloader:
+    """Download the full martj42 archive of international men's matches."""
+
+    def __init__(
+        self,
+        source_urls: list[str] | None = None,
+        output_path: Path = DEFAULT_INTL_CSV,
+        raw_dir: Path = RAW_SOURCE_DIR,
+    ) -> None:
+        self.source_urls = source_urls or INTERNATIONAL_RESULTS_SOURCE_URLS
+        self.output_path = output_path
+        self.raw_dir = raw_dir
+
+    def download(self, force: bool = True) -> Path:
+        if not force and self.output_path.exists():
+            return self.output_path
+        errors: list[str] = []
+        for url in self.source_urls:
+            try:
+                text = self._fetch(url)
+                if "home_team" not in text.splitlines()[0]:
+                    raise ValueError("unexpected header")
+                self.raw_dir.mkdir(parents=True, exist_ok=True)
+                self.output_path.parent.mkdir(parents=True, exist_ok=True)
+                self.output_path.write_text(text, encoding="utf-8")
+                return self.output_path
+            except Exception as exc:  # noqa: BLE001 - try next mirror
+                errors.append(f"{url}: {exc}")
+        if self.output_path.exists():
+            return self.output_path
+        raise RuntimeError("国际比赛数据下载失败，且本地无缓存：" + " | ".join(errors))
+
+    def _fetch(self, url: str) -> str:
+        headers = {"User-Agent": "WorldCupForecast/0.1 (+local research)"}
+        with httpx.Client(timeout=60, follow_redirects=True, headers=headers) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            response.encoding = response.encoding or "utf-8"
+            return response.text
+
+
+class InternationalResultsIngestor:
+    """Load the international archive into the dedicated ``intl_results`` table."""
+
+    def __init__(self, store: ForecastStore | None = None) -> None:
+        self.store = store or ForecastStore()
+
+    def load_csv(self, path: Path = DEFAULT_INTL_CSV) -> int:
+        rows: list[dict[str, Any]] = []
+        with open(path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for raw in reader:
+                home_score = _parse_int(raw.get("home_score", ""))
+                away_score = _parse_int(raw.get("away_score", ""))
+                date_text = (raw.get("date") or "").strip()
+                home = (raw.get("home_team") or "").strip()
+                away = (raw.get("away_team") or "").strip()
+                if home_score is None or away_score is None or not (date_text and home and away):
+                    continue
+                try:
+                    match_date = date.fromisoformat(date_text[:10])
+                except ValueError:
+                    continue
+                neutral_raw = (raw.get("neutral") or "").strip().lower()
+                rows.append(
+                    {
+                        "date": match_date,
+                        "home_team": home,
+                        "away_team": away,
+                        "home_score": home_score,
+                        "away_score": away_score,
+                        "tournament": (raw.get("tournament") or "Friendly").strip(),
+                        "neutral": neutral_raw in ("1", "true", "t", "yes"),
+                    }
+                )
+        rows.sort(key=lambda r: r["date"])
+        self.store.clear_intl_results()
+        return self.store.insert_intl_results(rows)
+
+
 class EloUpdater:
     def __init__(self, store: ForecastStore | None = None) -> None:
         self.store = store or ForecastStore()
 
     def update_from_results(self) -> dict[str, float]:
+        """Build Elo ratings, preferring the full international archive.
+
+        When ``intl_results`` is populated we use the entire match history with
+        tournament-importance and goal-difference weighting. Otherwise we fall
+        back to the World Cup-only ``match_results`` table.
+        """
+        intl_rows = self.store.get_intl_results()
+        if intl_rows:
+            return self._update_from_intl(intl_rows)
+        return self._update_from_world_cup()
+
+    def _update_from_intl(self, rows: list[dict]) -> dict[str, float]:
+        elo: dict[str, float] = dict(BASE_ELO)
+        for row in rows:
+            home, away = row["home_team"], row["away_team"]
+            elo.setdefault(home, NEUTRAL_ELO)
+            elo.setdefault(away, NEUTRAL_ELO)
+            k = importance_for(row["tournament"])
+            elo[home], elo[away] = _elo_update(
+                elo[home], elo[away],
+                int(row["home_score"]), int(row["away_score"]),
+                k, bool(row["neutral"]),
+                use_goal_difference=True,
+            )
+        self.store.upsert_team_elo(elo)
+        return elo
+
+    def _update_from_world_cup(self) -> dict[str, float]:
         rows = self.store.get_match_results()
         elo: dict[str, float] = dict(BASE_ELO)
         for row in rows:
             home, away = row["home_team"], row["away_team"]
-            elo.setdefault(home, 1500.0)
-            elo.setdefault(away, 1500.0)
+            elo.setdefault(home, NEUTRAL_ELO)
+            elo.setdefault(away, NEUTRAL_ELO)
             k = K_FACTORS.get(row["stage"], 40)
             new_home, new_away = _elo_update(
                 elo[home], elo[away],

@@ -826,3 +826,263 @@ th {
     grid-template-columns: 1fr;
   }
 }
+
+/* Multi-agent reasoning trace */
+.reasoning-trace {
+  display: grid;
+  gap: 10px;
+}
+
+.reasoning-card {
+  border: 1px solid var(--border);
+  border-left: 6px solid var(--muted);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.reasoning-card.positive {
+  border-left-color: var(--ok);
+}
+
+.reasoning-card.negative {
+  border-left-color: var(--danger);
+}
+
+.reasoning-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 12px 14px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.reasoning-head strong {
+  margin-right: auto;
+}
+
+.reasoning-signal {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.reasoning-conf {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.reasoning-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+.reasoning-badge.llm {
+  background: rgba(33, 104, 105, 0.12);
+  color: var(--primary);
+}
+
+.reasoning-body {
+  padding: 0 16px 14px 16px;
+}
+
+.reasoning-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.reasoning-step {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 0;
+  border-top: 1px dashed var(--border);
+}
+
+.reasoning-step p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.step-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.reasoning-step.conclusion .step-tag {
+  color: var(--primary);
+  font-weight: 600;
+}
+
+.reasoning-sources {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.reasoning-sources code {
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.reasoning-thinking {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.spin {
+  animation: spin 1.1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Home: natural-language ask + one-click today overview */
+.home {
+  display: grid;
+  gap: 16px;
+}
+
+.ask-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.ask-row input {
+  flex: 1;
+  border: none;
+  outline: none;
+  font-size: 15px;
+  background: none;
+  color: var(--text);
+}
+
+.ask-answer {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  line-height: 1.6;
+  border-left: 4px solid var(--primary);
+}
+
+.ask-answer.unmatched {
+  border-left-color: var(--muted);
+  color: var(--text-2);
+}
+
+.today-refresh {
+  margin-left: auto;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+
+.today-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.today-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  background: var(--surface);
+}
+
+.today-card.has-value {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+
+.today-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.today-card-head span {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.value-flag {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(33, 104, 105, 0.12);
+  color: var(--primary) !important;
+}
+
+.today-probs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.today-prob {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.today-prob.best {
+  background: rgba(33, 104, 105, 0.12);
+}
+
+.today-prob small {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.today-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.today-rec {
+  color: var(--primary);
+}

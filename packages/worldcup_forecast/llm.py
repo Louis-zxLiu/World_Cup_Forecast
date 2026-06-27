@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
+
 import httpx
 
-from .schemas import LLMSettings, PublicLLMSettings
+from .schemas import LLMSettings, PublicLLMSettings, PublicSearchSettings, SearchSettings
 
 
 def mask_key(api_key: str) -> str:
@@ -21,6 +24,18 @@ def public_llm_settings(settings: LLMSettings) -> PublicLLMSettings:
         model=settings.model,
         temperature=settings.temperature,
         timeout_seconds=settings.timeout_seconds,
+        enabled=settings.enabled,
+    )
+
+
+def public_search_settings(settings: SearchSettings) -> PublicSearchSettings:
+    return PublicSearchSettings(
+        provider=settings.provider,
+        base_url=settings.base_url,
+        api_key_masked=mask_key(settings.api_key),
+        api_key_saved=bool(settings.api_key),
+        timeout_seconds=settings.timeout_seconds,
+        max_results=settings.max_results,
         enabled=settings.enabled,
     )
 
@@ -51,3 +66,35 @@ class OpenAICompatibleClient:
     async def test_connection(self) -> dict[str, str | bool]:
         text = await self.complete("Reply with exactly OK.", "Health check")
         return {"ok": True, "message": text[:200]}
+
+    async def stream(self, system_prompt: str, user_prompt: str) -> AsyncIterator[str]:
+        """Yield response text incrementally via the OpenAI streaming API."""
+        if not self.settings.enabled or not self.settings.api_key:
+            raise RuntimeError("LLM is disabled or API key is empty")
+        url = f"{self.settings.base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": self.settings.model,
+            "temperature": self.settings.temperature,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        headers = {"Authorization": f"Bearer {self.settings.api_key}"}
+        async with httpx.AsyncClient(timeout=self.settings.timeout_seconds) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0]["delta"].get("content")
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+                    if delta:
+                        yield delta

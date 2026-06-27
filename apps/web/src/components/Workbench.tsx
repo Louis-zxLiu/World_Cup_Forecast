@@ -10,8 +10,9 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { api, type LiveMatch, type Prediction } from "../api";
+import { api, streamPrediction, type AgentReasoning, type LiveMatch, type Prediction } from "../api";
 import { MarkdownView } from "./MarkdownView";
+import { ReasoningTrace } from "./ReasoningTrace";
 
 type Props = {
   liveMatches: LiveMatch[];
@@ -95,7 +96,9 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
   const [params, setParams] = useState<ResearchParams>(DEFAULT_PARAMS);
   const [loading, setLoading] = useState("");
   const [prediction, setPrediction] = useState<Prediction | null>(null);
-  const [detailTab, setDetailTab] = useState<"signals" | "agents" | "features">("signals");
+  const [reasonings, setReasonings] = useState<AgentReasoning[]>([]);
+  const [streaming, setStreaming] = useState(false);
+  const [detailTab, setDetailTab] = useState<"reasoning" | "signals" | "agents" | "features">("reasoning");
 
   const home = selectedMatch?.home_team || homeTeam;
   const away = selectedMatch?.away_team || awayTeam;
@@ -151,22 +154,62 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
       return;
     }
     setLoading("predict");
+    setStreaming(true);
+    setReasonings([]);
+    setPrediction(null);
+    setDetailTab("reasoning");
+    const findings: AgentReasoning[] = [];
     try {
-      const result = await api<Prediction>("/api/predict/match", {
-        method: "POST",
-        body: JSON.stringify({
+      await streamPrediction(
+        {
           home_team: home,
           away_team: away,
           neutral_site: neutralSite,
           bankroll,
           ...params,
-        }),
-      });
-      setPrediction(result);
-      onMessage("预测完成。可以在下方查看投注信号、多智能体解释和特征贡献。", "info");
+        },
+        {
+          onPrediction: (data) => {
+            setPrediction({
+              probabilities: data.probabilities,
+              expected_score: data.expected_score,
+              most_likely_score: data.most_likely_score,
+              odds: data.odds ?? undefined,
+              bet_signals: data.bet_signals ?? [],
+              agent_findings: [],
+              explanation: "",
+              shap_values: data.shap_values ?? {},
+            });
+          },
+          onReasoning: (data) => {
+            findings.push(data);
+            setReasonings([...findings]);
+          },
+          onReport: (data) => {
+            setPrediction((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    explanation: data.explanation,
+                    agent_findings: findings.map((f) => ({
+                      agent: f.agent,
+                      confidence: f.confidence,
+                      signal: f.signal,
+                      rationale: f.rationale,
+                      sources: f.sources,
+                      metrics: f.metrics,
+                    })),
+                  }
+                : prev,
+            );
+          },
+        },
+      );
+      onMessage("预测完成。可在“推理过程”查看每位智能体的逐步推理。", "info");
     } catch (error) {
       onMessage(error instanceof Error ? error.message : "预测失败", "error");
     } finally {
+      setStreaming(false);
       setLoading("");
     }
   }
@@ -414,6 +457,9 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
       {prediction && (
         <section className="card details-card">
           <div className="segmented">
+            <button className={detailTab === "reasoning" ? "active" : ""} onClick={() => setDetailTab("reasoning")}>
+              推理过程
+            </button>
             <button className={detailTab === "signals" ? "active" : ""} onClick={() => setDetailTab("signals")}>
               投注信号
             </button>
@@ -424,6 +470,10 @@ export function Workbench({ liveMatches, onRefreshMatches, onMessage }: Props) {
               特征贡献
             </button>
           </div>
+
+          {detailTab === "reasoning" && (
+            <ReasoningTrace reasonings={reasonings} streaming={streaming} />
+          )}
 
           {detailTab === "signals" && (
             <div className="signal-grid">

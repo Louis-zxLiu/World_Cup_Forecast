@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import random
 import uuid
 from contextlib import asynccontextmanager
@@ -8,6 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from worldcup_forecast.agents import (
     BullBearDebateAgents,
@@ -18,13 +21,23 @@ from worldcup_forecast.agents import (
 from worldcup_forecast.backtest import BacktestRunner
 from worldcup_forecast.config import get_config
 from worldcup_forecast.espn import ESPNProvider
-from worldcup_forecast.ingest import EloUpdater, HistoricalIngestor, WorldCupDataDownloader
-from worldcup_forecast.llm import OpenAICompatibleClient, public_llm_settings
+from worldcup_forecast.ingest import (
+    EloUpdater,
+    HistoricalIngestor,
+    InternationalResultsDownloader,
+    InternationalResultsIngestor,
+    WorldCupDataDownloader,
+)
+from worldcup_forecast.llm import OpenAICompatibleClient, public_llm_settings, public_search_settings
 from worldcup_forecast.ml_model import SHAPExplainer, XGBoostForecaster
 from worldcup_forecast.modeling import BaselineForecastModel, build_bet_signals
 from worldcup_forecast.odds import FiveHundredLotteryProvider
 from worldcup_forecast.odds_cleaner import OddsCleaner
+from worldcup_forecast.reasoning import reason_for_finding
+from worldcup_forecast.search import WebSearchProvider
 from worldcup_forecast.schemas import (
+    AskRequest,
+    AskResponse,
     BacktestRunResult,
     BacktestRunRequest,
     GroupStandingRecord,
@@ -33,6 +46,7 @@ from worldcup_forecast.schemas import (
     MatchPredictionRequest,
     PredictionResult,
     ScrapeResult,
+    SearchSettings,
     TournamentBracket,
     TournamentFixture,
     TournamentScheduleImport,
@@ -78,6 +92,7 @@ async def lifespan(app: FastAPI):
                 if csv_path.exists():
                     HistoricalIngestor(local_store).load_csv(csv_path)
                     EloUpdater(local_store).update_from_results()
+                    baseline_model.refresh_elo(local_store)
             except Exception:
                 pass
 
@@ -111,7 +126,7 @@ app.add_middleware(
 )
 
 store = ForecastStore()
-baseline_model = BaselineForecastModel()
+baseline_model = BaselineForecastModel(store=store)
 xgb_model = XGBoostForecaster(store)
 xgb_model.load()
 
@@ -221,6 +236,30 @@ async def test_llm_settings(settings: LLMSettings | None = None):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/settings/search")
+def get_search_settings():
+    return public_search_settings(store.get_search_settings())
+
+
+@app.put("/api/settings/search")
+def update_search_settings(settings: SearchSettings):
+    if not settings.api_key:
+        settings.api_key = store.get_search_settings().api_key
+    saved = store.save_search_settings(settings)
+    return public_search_settings(saved)
+
+
+@app.post("/api/settings/search/test")
+async def test_search_settings(settings: SearchSettings | None = None):
+    candidate = settings or store.get_search_settings()
+    if candidate and not candidate.api_key:
+        candidate = candidate.model_copy(update={"api_key": store.get_search_settings().api_key})
+    outcome = await WebSearchProvider(candidate).search("世界杯 足球 最新")
+    if not outcome.ok:
+        raise HTTPException(status_code=400, detail=outcome.error)
+    return {"ok": True, "results": len(outcome.hits), "sample": [h.title for h in outcome.hits[:3]]}
+
+
 @app.post("/api/odds/china-lottery/scrape", response_model=ScrapeResult)
 async def scrape_china_lottery_odds(use_playwright: bool = False):
     result = await FiveHundredLotteryProvider().scrape(use_playwright=use_playwright)
@@ -240,13 +279,23 @@ def latest_odds(limit: int = 100):
 
 
 @app.post("/api/ingest/run")
-def run_ingestion(force_download: bool = True) -> WorldCupDataImportResult:
+def run_ingestion(force_download: bool = True, include_international: bool = True) -> WorldCupDataImportResult:
     try:
         result = WorldCupDataDownloader().download_and_prepare(force=force_download)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     count = HistoricalIngestor(store).load_csv(Path(result.output_path))
+    # Pull the full international archive so Elo and recent form cover every
+    # national team, not just frequent World Cup participants.
+    if include_international:
+        try:
+            intl_path = InternationalResultsDownloader().download(force=force_download)
+            intl_count = InternationalResultsIngestor(store).load_csv(intl_path)
+            result.message = f"{result.message} 国际比赛档案 {intl_count} 场已载入。".strip()
+        except Exception as exc:  # noqa: BLE001 - international data is best-effort
+            result.message = f"{result.message} 国际比赛档案下载失败：{exc}".strip()
     elo = EloUpdater(store).update_from_results()
+    baseline_model.refresh_elo(store)
     result.imported_records = count
     result.teams_with_elo = len(elo)
     return result
@@ -282,7 +331,7 @@ async def predict_match(request: MatchPredictionRequest):
         most_likely_score=distribution.most_likely_score,
         odds=odds,
         bet_signals=build_bet_signals(request, distribution.probabilities, odds),
-        agent_findings=build_agent_findings(request, odds),
+        agent_findings=build_agent_findings(request, odds, store, store.get_search_settings()),
         shap_values=shap_values,
         explanation="",
     )
@@ -310,7 +359,101 @@ async def predict_match(request: MatchPredictionRequest):
     return result
 
 
-@app.post("/api/predict/tournament", response_model=TournamentBracket)
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+@app.post("/api/predict/match/stream")
+async def predict_match_stream(request: MatchPredictionRequest):
+    """Stream the multi-agent prediction, exposing each agent's reasoning live.
+
+    Emits Server-Sent Events: ``prediction`` (probabilities + bet signals),
+    then one ``reasoning`` event per agent as its chain of thought is produced,
+    and finally a ``report`` event with the synthesized explanation.
+    """
+
+    async def event_stream():
+        active = _active_model()
+        odds = store.find_match_odds(request.home_team, request.away_team)
+        distribution = active.predict_score_distribution(request)
+        shap_values: dict[str, float] = {}
+        if xgb_model._clf is not None:
+            shap_values = SHAPExplainer(xgb_model).top_features(
+                request.home_team, request.away_team, request.neutral_site
+            )
+
+        result = PredictionResult(
+            match=request,
+            probabilities=distribution.probabilities,
+            expected_score=(
+                round(distribution.expected_home_goals, 3),
+                round(distribution.expected_away_goals, 3),
+            ),
+            most_likely_score=distribution.most_likely_score,
+            odds=odds,
+            bet_signals=build_bet_signals(request, distribution.probabilities, odds),
+            agent_findings=build_agent_findings(request, odds, store, store.get_search_settings()),
+            shap_values=shap_values,
+            explanation="",
+        )
+        result.agent_findings.extend(BullBearDebateAgents().debate(result))
+        result.agent_findings.append(RiskManagerAgent().analyze(result))
+
+        yield _sse(
+            "prediction",
+            {
+                "probabilities": result.probabilities.model_dump(),
+                "expected_score": result.expected_score,
+                "most_likely_score": result.most_likely_score,
+                "bet_signals": [s.model_dump() for s in result.bet_signals],
+                "odds": result.odds.model_dump() if result.odds else None,
+                "shap_values": result.shap_values,
+            },
+        )
+
+        settings = store.get_llm_settings()
+        # Launch every agent's reasoning concurrently so the slow LLM calls
+        # overlap, then stream them in their original order to keep the UI's
+        # progressive reveal intact. The final synthesized report is kicked off
+        # alongside the per-agent reasoning so it doesn't add latency at the end.
+        reasoning_tasks = [
+            asyncio.create_task(reason_for_finding(finding.agent, finding, request, settings))
+            for finding in result.agent_findings
+        ]
+
+        async def _build_report() -> str:
+            if settings.enabled and settings.api_key:
+                try:
+                    prompt = (
+                        "请用中文生成一份简洁、可解释、带风险提示的世界杯单场预测报告。"
+                        f"数据如下：{result.model_dump_json()}"
+                    )
+                    return await OpenAICompatibleClient(settings).complete(
+                        "你是谨慎的足球量化和投注风控分析师，不承诺稳赚。",
+                        prompt,
+                    )
+                except Exception:
+                    return template_explanation(result)
+            return template_explanation(result)
+
+        report_task = asyncio.create_task(_build_report())
+
+        for task in reasoning_tasks:
+            reasoning = await task
+            yield _sse("reasoning", reasoning.model_dump())
+
+        result.explanation = await report_task
+
+        report_id = str(uuid.uuid4())
+        store.save_report(report_id, result.model_dump_json())
+        yield _sse("report", {"explanation": result.explanation, "report_id": report_id})
+        yield _sse("done", {"report_id": report_id})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 def predict_tournament(request: TournamentSimulationRequest):
     random.seed(42)
     elo_map = {**store.get_team_elo()}
@@ -359,6 +502,160 @@ async def espn_sync():
 @app.get("/api/espn/matches")
 def espn_matches():
     return store.get_live_matches()
+
+
+def _quick_prediction(request: MatchPredictionRequest) -> PredictionResult:
+    """Run a non-streaming prediction without LLM narration (fast, for batch use)."""
+    active = _active_model()
+    odds = store.find_match_odds(request.home_team, request.away_team)
+    distribution = active.predict_score_distribution(request)
+    result = PredictionResult(
+        match=request,
+        probabilities=distribution.probabilities,
+        expected_score=(
+            round(distribution.expected_home_goals, 3),
+            round(distribution.expected_away_goals, 3),
+        ),
+        most_likely_score=distribution.most_likely_score,
+        odds=odds,
+        bet_signals=build_bet_signals(request, distribution.probabilities, odds),
+        agent_findings=build_agent_findings(request, odds, store),
+        explanation="",
+    )
+    result.agent_findings.extend(BullBearDebateAgents().debate(result))
+    result.agent_findings.append(RiskManagerAgent().analyze(result))
+    result.explanation = template_explanation(result)
+    return result
+
+
+@app.get("/api/predict/today")
+def predict_today(bankroll: float = 10000, limit: int = 12):
+    """One-click overview: predict every upcoming/live match on the schedule.
+
+    Requires no input from the user. Returns each match's probabilities plus its
+    single strongest value bet (if any), sorted so the best opportunities surface
+    first.
+    """
+    matches = store.get_live_matches()
+    upcoming = [
+        m for m in matches
+        if m.get("home_team") and m.get("away_team") and not m.get("completed")
+    ]
+    if not upcoming:
+        upcoming = [m for m in matches if m.get("home_team") and m.get("away_team")]
+
+    cards = []
+    for match in upcoming[:limit]:
+        request = MatchPredictionRequest(
+            home_team=match["home_team"],
+            away_team=match["away_team"],
+            neutral_site=True,
+            bankroll=bankroll,
+        )
+        result = _quick_prediction(request)
+        value_bets = [s for s in result.bet_signals if s.stake > 0 and (s.edge or 0) > request.value_edge_threshold]
+        best = max(value_bets, key=lambda s: s.edge or 0, default=None)
+        cards.append(
+            {
+                "match_id": match.get("match_id"),
+                "home_team": match["home_team"],
+                "away_team": match["away_team"],
+                "kickoff_time": match.get("date"),
+                "status": match.get("status_name"),
+                "probabilities": result.probabilities.model_dump(),
+                "most_likely_score": result.most_likely_score,
+                "recommendation": best.model_dump() if best else None,
+                "has_value": best is not None,
+            }
+        )
+    cards.sort(key=lambda c: (c["recommendation"]["edge"] if c["recommendation"] else -1), reverse=True)
+    return {"count": len(cards), "cards": cards}
+
+
+def _extract_teams_rule(question: str) -> tuple[str | None, str | None]:
+    """Find up to two team names in a question using the known alias map."""
+    from worldcup_forecast.odds import TEAM_ALIASES
+
+    found: list[str] = []
+    # Chinese aliases first (longer names matched before shorter substrings).
+    for alias in sorted(TEAM_ALIASES, key=len, reverse=True):
+        if alias in question and TEAM_ALIASES[alias] not in found:
+            found.append(TEAM_ALIASES[alias])
+        if len(found) == 2:
+            break
+    if len(found) < 2:
+        known_en = set(store.get_team_elo().keys())
+        for team in sorted(known_en, key=len, reverse=True):
+            if team.lower() in question.lower() and team not in found:
+                found.append(team)
+            if len(found) == 2:
+                break
+    home = found[0] if found else None
+    away = found[1] if len(found) > 1 else None
+    return home, away
+
+
+async def _extract_teams_llm(question: str, settings: LLMSettings) -> tuple[str | None, str | None]:
+    prompt = (
+        "从这句话里提取两支足球国家队的英文规范名（如 Brazil、Germany）。"
+        "第一支按主队、第二支按客队。只返回 JSON："
+        '{"home":"...","away":"..."}，无法识别填 null。\n'
+        f"句子：{question}"
+    )
+    raw = await OpenAICompatibleClient(settings).complete(
+        "你是足球比赛信息抽取器，只输出 JSON。", prompt
+    )
+    cleaned = raw.strip().strip("`")
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    data = json.loads(cleaned[start : end + 1])
+    return data.get("home"), data.get("away")
+
+
+@app.post("/api/ask", response_model=AskResponse)
+async def ask(request: AskRequest):
+    """Natural-language entry point: ask a question, get a prediction-backed answer."""
+    settings = store.get_llm_settings()
+    home = away = None
+    if settings.enabled and settings.api_key:
+        try:
+            home, away = await _extract_teams_llm(request.question, settings)
+        except Exception:
+            home, away = None, None
+    if not (home and away):
+        home, away = _extract_teams_rule(request.question)
+
+    if not (home and away):
+        return AskResponse(
+            question=request.question,
+            answer="没能从问题里识别出两支球队。可以试试「巴西对德国谁会赢」这样的问法。",
+            matched=False,
+        )
+
+    pred = _quick_prediction(
+        MatchPredictionRequest(home_team=home, away_team=away, bankroll=request.bankroll)
+    )
+    probs = pred.probabilities
+    outcome_label = {"home_win": f"{home}胜", "draw": "平局", "away_win": f"{away}胜"}
+    best_key = max(("home_win", "draw", "away_win"), key=lambda k: getattr(probs, k))
+    answer = (
+        f"{home} vs {away}：胜平负概率 "
+        f"{probs.home_win:.0%}/{probs.draw:.0%}/{probs.away_win:.0%}，"
+        f"最可能结果是{outcome_label[best_key]}，预计比分 {pred.most_likely_score}。"
+    )
+    value_bets = [s for s in pred.bet_signals if s.stake > 0 and (s.edge or 0) > 0.025]
+    if value_bets:
+        best = max(value_bets, key=lambda s: s.edge or 0)
+        answer += f" 价值提示：{outcome_label[best.outcome]} 有 {best.edge:.1%} 正向 edge，建议小仓位 {best.stake:.0f}。"
+    else:
+        answer += " 当前没有明显的价值投注机会，建议观望。"
+
+    return AskResponse(
+        question=request.question,
+        home_team=home,
+        away_team=away,
+        answer=answer,
+        matched=True,
+    )
 
 
 @app.get("/api/espn/teams")

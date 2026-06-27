@@ -32,6 +32,94 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json();
 }
 
+export type StreamHandlers = {
+  onPrediction?: (data: any) => void;
+  onReasoning?: (data: AgentReasoning) => void;
+  onReport?: (data: { explanation: string; report_id: string }) => void;
+  onDone?: (data: { report_id: string }) => void;
+  onError?: (error: Error) => void;
+};
+
+/**
+ * Stream a multi-agent prediction via Server-Sent Events, surfacing each
+ * agent's reasoning trace as it is produced.
+ */
+export async function streamPrediction(
+  body: Record<string, unknown>,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/predict/match/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!response.ok || !response.body) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || response.statusText);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const dispatch = (event: string, data: string) => {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (event === "prediction") handlers.onPrediction?.(parsed);
+    else if (event === "reasoning") handlers.onReasoning?.(parsed as AgentReasoning);
+    else if (event === "report") handlers.onReport?.(parsed);
+    else if (event === "done") handlers.onDone?.(parsed);
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() ?? "";
+    for (const chunk of chunks) {
+      let event = "message";
+      let data = "";
+      for (const line of chunk.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (data) dispatch(event, data);
+    }
+  }
+}
+
+export type AskResponse = {
+  question: string;
+  home_team: string | null;
+  away_team: string | null;
+  answer: string;
+  matched: boolean;
+};
+
+export type TodayCard = {
+  match_id: string;
+  home_team: string;
+  away_team: string;
+  kickoff_time?: string | null;
+  status?: string | null;
+  probabilities: { home_win: number; draw: number; away_win: number };
+  most_likely_score: string;
+  recommendation: BetSignal | null;
+  has_value: boolean;
+};
+
+export type TodayOverview = {
+  count: number;
+  cards: TodayCard[];
+};
+
 export type Health = {
   status: string;
   db_path: string;
@@ -54,6 +142,20 @@ export type LLMSettings = {
 };
 
 export type PublicLLMSettings = Omit<LLMSettings, "api_key"> & {
+  api_key_masked: string;
+  api_key_saved: boolean;
+};
+
+export type SearchSettings = {
+  provider: "none" | "bocha" | "zhipu" | "custom";
+  base_url: string;
+  api_key: string;
+  timeout_seconds: number;
+  max_results: number;
+  enabled: boolean;
+};
+
+export type PublicSearchSettings = Omit<SearchSettings, "api_key"> & {
   api_key_masked: string;
   api_key_saved: boolean;
 };
@@ -84,6 +186,22 @@ export type AgentFinding = {
   rationale: string;
   sources: string[];
   metrics?: Record<string, number>;
+};
+
+export type ReasoningStep = {
+  kind: "observation" | "analysis" | "conclusion";
+  content: string;
+};
+
+export type AgentReasoning = {
+  agent: string;
+  confidence: number;
+  signal: "positive" | "neutral" | "negative";
+  steps: ReasoningStep[];
+  rationale: string;
+  sources: string[];
+  metrics?: Record<string, number>;
+  powered_by: "llm" | "deterministic";
 };
 
 export type BetSignal = {

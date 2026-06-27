@@ -14,6 +14,7 @@ data/raw/odds_snapshots/*
 data/raw/worldcup_sources/*
 data/worldcup.duckdb
 data/worldcup.duckdb.wal
+data/intl_results.csv
 node_modules/
 dist/
 apps/web/node_modules/

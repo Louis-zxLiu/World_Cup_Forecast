@@ -6,8 +6,15 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .ingest import EloUpdater, _elo_expected, _elo_update, K_FACTORS, HOME_ADVANTAGE
-from .modeling import BASE_ELO, BaselineForecastModel, poisson_probability, normalize
+from .ingest import (
+    EloUpdater,
+    HOME_ADVANTAGE,
+    K_FACTORS,
+    _elo_expected,
+    _elo_update,
+    importance_for,
+)
+from .modeling import BASE_ELO, BaselineForecastModel, dixon_coles_tau, poisson_probability, normalize
 from .schemas import BacktestMetrics, BacktestRunRequest, BacktestRunResult, MatchPredictionRequest
 from .storage import ForecastStore
 
@@ -17,7 +24,8 @@ def _poisson_match_probs(home_rate: float, away_rate: float) -> tuple[float, flo
     for hg in range(7):
         for ag in range(7):
             p = (math.exp(-home_rate) * home_rate ** hg / math.factorial(hg)) * \
-                (math.exp(-away_rate) * away_rate ** ag / math.factorial(ag))
+                (math.exp(-away_rate) * away_rate ** ag / math.factorial(ag)) * \
+                dixon_coles_tau(hg, ag, home_rate, away_rate)
             if hg > ag:
                 hw += p
             elif hg == ag:
@@ -74,6 +82,7 @@ class BacktestRunner:
         years = params.years
 
         all_results = self.store.get_match_results()
+        intl_results = self.store.get_intl_results()
         run_id = str(uuid.uuid4())
         metrics_list: list[BacktestMetrics] = []
 
@@ -82,19 +91,36 @@ class BacktestRunner:
             if not year_results:
                 continue
 
-            # Build rolling Elo from all matches BEFORE this tournament
-            prior_results = [r for r in all_results if int(r["year"]) < year]
+            # Build rolling Elo from matches BEFORE this tournament. Prefer the
+            # full international archive (friendlies, qualifiers, other cups) so
+            # ratings are realistic; fall back to prior World Cup matches only.
             elo: dict[str, float] = dict(BASE_ELO)
-            for row in prior_results:
-                home, away = row["home_team"], row["away_team"]
-                elo.setdefault(home, 1500.0)
-                elo.setdefault(away, 1500.0)
-                k = K_FACTORS.get(row["stage"], 40)
-                elo[home], elo[away] = _elo_update(
-                    elo[home], elo[away],
-                    int(row["home_score"]), int(row["away_score"]),
-                    k, bool(row["neutral"]),
-                )
+            if intl_results:
+                cutoff = min(str(r["date"]) for r in year_results)
+                prior_intl = [r for r in intl_results if str(r["date"]) < cutoff]
+                for row in prior_intl:
+                    home, away = row["home_team"], row["away_team"]
+                    elo.setdefault(home, 1500.0)
+                    elo.setdefault(away, 1500.0)
+                    k = importance_for(row["tournament"])
+                    elo[home], elo[away] = _elo_update(
+                        elo[home], elo[away],
+                        int(row["home_score"]), int(row["away_score"]),
+                        k, bool(row["neutral"]),
+                        use_goal_difference=True,
+                    )
+            else:
+                prior_results = [r for r in all_results if int(r["year"]) < year]
+                for row in prior_results:
+                    home, away = row["home_team"], row["away_team"]
+                    elo.setdefault(home, 1500.0)
+                    elo.setdefault(away, 1500.0)
+                    k = K_FACTORS.get(row["stage"], 40)
+                    elo[home], elo[away] = _elo_update(
+                        elo[home], elo[away],
+                        int(row["home_score"]), int(row["away_score"]),
+                        k, bool(row["neutral"]),
+                    )
 
             model_probs: list[tuple[float, float, float]] = []
             baseline_probs: list[tuple[float, float, float]] = []

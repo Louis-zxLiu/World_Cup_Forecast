@@ -49,6 +49,53 @@ def test_form_agent_schema():
     _assert_finding(FormAgent().analyze(_sample_request()))
 
 
+def test_form_agent_uses_real_intl_data(tmp_store):
+    from datetime import date
+
+    rows = [
+        {"date": date(2024, 1, i + 1), "home_team": "Brazil", "away_team": "Chile",
+         "home_score": 3, "away_score": 0, "tournament": "Friendly", "neutral": False}
+        for i in range(6)
+    ] + [
+        {"date": date(2024, 2, i + 1), "home_team": "Chile", "away_team": "Peru",
+         "home_score": 0, "away_score": 2, "tournament": "Friendly", "neutral": False}
+        for i in range(6)
+    ]
+    tmp_store.insert_intl_results(rows)
+    finding = FormAgent(tmp_store).analyze(
+        MatchPredictionRequest(home_team="Brazil", away_team="Chile")
+    )
+    _assert_finding(finding)
+    # Brazil winning every game should read as positive recent form.
+    assert finding.signal == "positive"
+    assert finding.metrics["home_ppg"] > finding.metrics["away_ppg"]
+    assert finding.sources == ["internal:intl_results"]
+
+
+def test_news_agent_honest_when_search_unconfigured():
+    """With no search source configured, the news agent must report search_ok
+    False rather than silently claiming a neutral signal."""
+    from worldcup_forecast.schemas import SearchSettings
+
+    finding = NewsSentimentAgent(SearchSettings(provider="none", enabled=False)).analyze(
+        _sample_request()
+    )
+    _assert_finding(finding)
+    assert finding.metrics.get("search_ok") is False
+    assert "搜索源" in finding.rationale or "RSS" in finding.rationale
+
+
+def test_strength_agent_uses_team_elo(tmp_store):
+    tmp_store.upsert_team_elo({"Atlantis": 2200.0, "Lilliput": 1400.0})
+    finding = StrengthAgent(tmp_store).analyze(
+        MatchPredictionRequest(home_team="Atlantis", away_team="Lilliput")
+    )
+    _assert_finding(finding)
+    assert finding.signal == "positive"
+    assert finding.metrics["home_elo"] == 2200.0
+    assert finding.sources == ["internal:team_elo"]
+
+
 def test_news_sentiment_agent_schema():
     _assert_finding(NewsSentimentAgent().analyze(_sample_request()))
 

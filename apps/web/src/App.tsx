@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { BarChart3, Brain, Gauge, Settings as SettingsIcon, TestTube2, Trophy } from "lucide-react";
+import { BarChart3, Brain, Gauge, Home as HomeIcon, Settings as SettingsIcon, TestTube2, Trophy } from "lucide-react";
 import { api, type Health, type LLMSettings, type LiveMatch, type OddsRecord, type PublicLLMSettings } from "./api";
 import { Backtest } from "./components/Backtest";
 import { Header } from "./components/Header";
+import { Home } from "./components/Home";
 import { OddsLog } from "./components/OddsLog";
 import { Settings } from "./components/Settings";
 import { Tournament } from "./components/Tournament";
@@ -20,6 +21,7 @@ const DEFAULT_LLM_SETTINGS: LLMSettings = {
 };
 
 const TABS = [
+  { id: "home", label: "首页", icon: HomeIcon },
   { id: "predict", label: "预测工作台", icon: Brain },
   { id: "odds", label: "500赔率", icon: Gauge },
   { id: "tourney", label: "锦标赛模拟", icon: Trophy },
@@ -48,7 +50,7 @@ function saveLocalSettings(settings: LLMSettings) {
 }
 
 export function App() {
-  const [tab, setTab] = useState<TabId>("predict");
+  const [tab, setTab] = useState<TabId>("home");
   const [health, setHealth] = useState<Health | null>(null);
   const [odds, setOdds] = useState<OddsRecord[]>([]);
   const [liveMatches, setLiveMatches] = useState<LiveMatch[]>([]);
@@ -129,6 +131,9 @@ export function App() {
           </button>
         )}
 
+        {tab === "home" && (
+          <Home onMessage={(m, type = "info") => notify(m, type)} />
+        )}
         {tab === "predict" && (
           <Workbench
             liveMatches={liveMatches}

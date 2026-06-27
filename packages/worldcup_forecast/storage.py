@@ -7,7 +7,7 @@ from threading import RLock
 import duckdb
 
 from .config import get_config
-from .schemas import GroupStandingRecord, LLMSettings, OddsRecord
+from .schemas import GroupStandingRecord, LLMSettings, OddsRecord, SearchSettings
 
 
 class ForecastStore:
@@ -30,6 +30,20 @@ class ForecastStore:
                     model VARCHAR NOT NULL,
                     temperature DOUBLE NOT NULL,
                     timeout_seconds INTEGER NOT NULL,
+                    enabled BOOLEAN NOT NULL,
+                    updated_at TIMESTAMP DEFAULT current_timestamp
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_settings (
+                    id INTEGER PRIMARY KEY,
+                    provider VARCHAR NOT NULL,
+                    base_url VARCHAR NOT NULL,
+                    api_key VARCHAR NOT NULL,
+                    timeout_seconds INTEGER NOT NULL,
+                    max_results INTEGER NOT NULL,
                     enabled BOOLEAN NOT NULL,
                     updated_at TIMESTAMP DEFAULT current_timestamp
                 )
@@ -77,6 +91,22 @@ class ForecastStore:
                     team VARCHAR PRIMARY KEY,
                     elo DOUBLE NOT NULL,
                     updated_at TIMESTAMP DEFAULT current_timestamp
+                )
+                """
+            )
+            self.conn.execute("CREATE SEQUENCE IF NOT EXISTS intl_results_seq START 1")
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intl_results (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('intl_results_seq'),
+                    date DATE,
+                    home_team VARCHAR,
+                    away_team VARCHAR,
+                    home_score INTEGER,
+                    away_score INTEGER,
+                    tournament VARCHAR,
+                    neutral BOOLEAN,
+                    inserted_at TIMESTAMP DEFAULT current_timestamp
                 )
                 """
             )
@@ -235,6 +265,66 @@ class ForecastStore:
             rows = self.conn.execute("SELECT team, elo FROM team_elo").fetchall()
         return {row[0]: row[1] for row in rows}
 
+    def clear_intl_results(self) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM intl_results")
+
+    def insert_intl_results(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        with self._lock:
+            self.conn.executemany(
+                """
+                INSERT INTO intl_results
+                (date, home_team, away_team, home_score, away_score, tournament, neutral)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    [
+                        r["date"],
+                        r["home_team"],
+                        r["away_team"],
+                        r["home_score"],
+                        r["away_score"],
+                        r["tournament"],
+                        r["neutral"],
+                    ]
+                    for r in rows
+                ],
+            )
+        return len(rows)
+
+    def get_intl_results(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT date, home_team, away_team, home_score, away_score, tournament, neutral
+                FROM intl_results
+                ORDER BY date
+                """
+            ).fetchall()
+        keys = ["date", "home_team", "away_team", "home_score", "away_score", "tournament", "neutral"]
+        return [dict(zip(keys, row)) for row in rows]
+
+    def intl_count(self) -> int:
+        return self._count("intl_results")
+
+    def get_recent_intl_for_team(self, team: str, limit: int = 10) -> list[dict]:
+        """Most recent international matches for a team (either home or away)."""
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT date, home_team, away_team, home_score, away_score, tournament, neutral
+                FROM intl_results
+                WHERE home_team = ? OR away_team = ?
+                ORDER BY date DESC
+                LIMIT ?
+                """,
+                [team, team, limit],
+            ).fetchall()
+        keys = ["date", "home_team", "away_team", "home_score", "away_score", "tournament", "neutral"]
+        return [dict(zip(keys, row)) for row in rows]
+
     def save_backtest_run(self, run_id: str, model_version: str, payload: str) -> None:
         with self._lock:
             self.conn.execute(
@@ -292,6 +382,46 @@ class ForecastStore:
                     settings.model,
                     settings.temperature,
                     settings.timeout_seconds,
+                    settings.enabled,
+                ],
+            )
+        return settings
+
+    def get_search_settings(self) -> SearchSettings:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT provider, base_url, api_key, timeout_seconds, max_results, enabled
+                FROM search_settings
+                WHERE id = 1
+                """
+            ).fetchone()
+        if not row:
+            return SearchSettings()
+        return SearchSettings(
+            provider=row[0],
+            base_url=row[1],
+            api_key=row[2],
+            timeout_seconds=row[3],
+            max_results=row[4],
+            enabled=row[5],
+        )
+
+    def save_search_settings(self, settings: SearchSettings) -> SearchSettings:
+        with self._lock:
+            self.conn.execute("DELETE FROM search_settings WHERE id = 1")
+            self.conn.execute(
+                """
+                INSERT INTO search_settings
+                (id, provider, base_url, api_key, timeout_seconds, max_results, enabled)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    settings.provider,
+                    settings.base_url.rstrip("/"),
+                    settings.api_key,
+                    settings.timeout_seconds,
+                    settings.max_results,
                     settings.enabled,
                 ],
             )

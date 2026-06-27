@@ -25,6 +25,31 @@ class PublicLLMSettings(BaseModel):
     enabled: bool
 
 
+class SearchSettings(BaseModel):
+    """Configuration for the pluggable web-search layer (decoupled from the LLM).
+
+    ``provider`` selects the request/response adapter. ``bocha`` and ``zhipu``
+    are JSON search APIs reachable from mainland China; ``none`` disables search.
+    """
+
+    provider: Literal["none", "bocha", "zhipu", "custom"] = "none"
+    base_url: str = "https://api.bochaai.com/v1/web-search"
+    api_key: str = ""
+    timeout_seconds: int = Field(default=15, ge=1, le=60)
+    max_results: int = Field(default=6, ge=1, le=20)
+    enabled: bool = False
+
+
+class PublicSearchSettings(BaseModel):
+    provider: str
+    base_url: str
+    api_key_masked: str
+    api_key_saved: bool = False
+    timeout_seconds: int
+    max_results: int
+    enabled: bool
+
+
 class OddsRecord(BaseModel):
     match_id: str
     kickoff_time: datetime | None = None
@@ -48,6 +73,39 @@ class AgentFinding(BaseModel):
     rationale: str
     sources: list[str] = Field(default_factory=list)
     metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReasoningStep(BaseModel):
+    """One step in an agent's exposed chain of reasoning."""
+
+    kind: Literal["observation", "analysis", "conclusion"]
+    content: str
+
+
+class AgentReasoning(BaseModel):
+    """An agent's finding enriched with an explicit, inspectable reasoning trace."""
+
+    agent: str
+    confidence: float = Field(ge=0, le=1)
+    signal: Literal["positive", "neutral", "negative"]
+    steps: list[ReasoningStep] = Field(default_factory=list)
+    rationale: str = ""
+    sources: list[str] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    powered_by: Literal["llm", "deterministic"] = "deterministic"
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    bankroll: float = Field(default=10000, gt=0)
+
+
+class AskResponse(BaseModel):
+    question: str
+    home_team: str | None = None
+    away_team: str | None = None
+    answer: str
+    matched: bool = False
 
 
 class MatchPredictionRequest(BaseModel):

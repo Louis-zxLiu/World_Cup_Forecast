@@ -1,28 +1,73 @@
 from __future__ import annotations
 
+import re
+from typing import TYPE_CHECKING
+
+from .form import team_form
 from .modeling import BASE_ELO, team_strength
 from .news import RSSNewsProvider
 from .schemas import AgentFinding, MatchPredictionRequest, OddsRecord, PredictionResult
+
+if TYPE_CHECKING:
+    from .schemas import SearchSettings
+    from .search import SearchOutcome
+    from .storage import ForecastStore
+
+# Injury / availability keywords for scanning news titles and snippets.
+_INJURY_KEYWORDS = re.compile(
+    r"injur|absence|absent|doubt|suspend|ruled out|伤|缺阵|缺席|停赛|伤停|受伤|无缘|休战|疑似",
+    re.IGNORECASE,
+)
+
+
+def _has_injury_signal(outcome: "SearchOutcome") -> bool:
+    for hit in outcome.hits:
+        text = f"{hit.title} {hit.snippet}"
+        if _INJURY_KEYWORDS.search(text):
+            return True
+    return False
+
+
+def _injury_to_signal(
+    request: MatchPredictionRequest,
+    home_injury: bool,
+    away_injury: bool,
+    search: bool,
+) -> tuple[str, str, float]:
+    if home_injury and not away_injury:
+        return "negative", f"{request.home_team} 相关报道出现伤停/缺阵信号，可能削弱主队。", 0.6
+    if away_injury and not home_injury:
+        return "positive", f"{request.away_team} 相关报道出现伤停/缺阵信号，客队可能减员。", 0.6
+    if home_injury and away_injury:
+        return "neutral", "双方都有伤停信号，方向相互抵消，暂不单边调整。", 0.5
+    return "neutral", "近期报道未发现明确伤停信号，阵容状态暂按正常处理。", 0.45
 
 
 class StrengthAgent:
     name = "实力分析员"
 
+    def __init__(self, store: "ForecastStore | None" = None) -> None:
+        self.store = store
+        self._elo_map = store.get_team_elo() if store is not None else {}
+
     def analyze(self, request: MatchPredictionRequest) -> AgentFinding:
-        home = team_strength(request.home_team)
-        away = team_strength(request.away_team)
+        home = team_strength(request.home_team, self._elo_map)
+        away = team_strength(request.away_team, self._elo_map)
         diff = home - away
         signal = "positive" if diff > 30 else "negative" if diff < -30 else "neutral"
-        confidence = 0.72 if request.home_team in BASE_ELO or request.away_team in BASE_ELO else 0.45
+        known = request.home_team in self._elo_map or request.away_team in self._elo_map
+        known = known or request.home_team in BASE_ELO or request.away_team in BASE_ELO
+        confidence = 0.72 if known else 0.45
+        source = "internal:team_elo" if self._elo_map else "internal:baseline_elo"
         return AgentFinding(
             agent=self.name,
             confidence=confidence,
             signal=signal,
             rationale=(
-                f"Elo 基准：{request.home_team} {home:.0f} vs "
+                f"Elo 评分：{request.home_team} {home:.0f} vs "
                 f"{request.away_team} {away:.0f}，实力差 {diff:+.0f}。"
             ),
-            sources=["internal:baseline_elo"],
+            sources=[source],
             metrics={"home_elo": home, "away_elo": away, "elo_diff": diff},
         )
 
@@ -30,56 +75,142 @@ class StrengthAgent:
 class FormAgent:
     name = "近期状态分析员"
 
+    def __init__(self, store: "ForecastStore | None" = None) -> None:
+        self.store = store
+
     def analyze(self, request: MatchPredictionRequest) -> AgentFinding:
+        if self.store is None or self.store.intl_count() == 0:
+            return AgentFinding(
+                agent=self.name,
+                confidence=0.4,
+                signal="neutral",
+                rationale=(
+                    "尚未载入国际比赛档案，近期状态暂不调整，先按长期实力和赔率处理。"
+                ),
+                sources=["planned:international_results_ingestion"],
+            )
+
+        home = team_form(self.store, request.home_team, limit=10)
+        away = team_form(self.store, request.away_team, limit=10)
+
+        if home.matches == 0 and away.matches == 0:
+            return AgentFinding(
+                agent=self.name,
+                confidence=0.35,
+                signal="neutral",
+                rationale="两队近期均无可用国际比赛记录，状态维度暂不调整。",
+                sources=["internal:intl_results"],
+            )
+
+        ppg_gap = home.points_per_game - away.points_per_game
+        if ppg_gap > 0.5:
+            signal = "positive"
+        elif ppg_gap < -0.5:
+            signal = "negative"
+        else:
+            signal = "neutral"
+        # Confidence grows with how much recent data backs each side.
+        confidence = round(min(0.8, 0.45 + 0.02 * (home.matches + away.matches)), 2)
+        rationale = (
+            f"近10场：{request.home_team} {home.form_string()}"
+            f"（场均{home.points_per_game:.2f}分，净胜球{home.goal_diff_per_game:+.2f}）"
+            f"，{request.away_team} {away.form_string()}"
+            f"（场均{away.points_per_game:.2f}分，净胜球{away.goal_diff_per_game:+.2f}）。"
+        )
         return AgentFinding(
             agent=self.name,
-            confidence=0.4,
-            signal="neutral",
-            rationale=(
-                "当前版本已预留历史战绩接入；若未导入 wc_results.csv，"
-                "近期状态暂不额外调整，先按长期实力和赔率处理。"
-            ),
-            sources=["planned:international_results_ingestion"],
+            confidence=confidence,
+            signal=signal,
+            rationale=rationale,
+            sources=["internal:intl_results"],
+            metrics={
+                "home_ppg": round(home.points_per_game, 3),
+                "away_ppg": round(away.points_per_game, 3),
+                "home_form": home.form_string(),
+                "away_form": away.form_string(),
+                "home_gd_per_game": round(home.goal_diff_per_game, 3),
+                "away_gd_per_game": round(away.goal_diff_per_game, 3),
+                "ppg_gap": round(ppg_gap, 3),
+            },
         )
 
 
 class NewsSentimentAgent:
     name = "新闻舆情分析员"
 
-    def analyze(self, request: MatchPredictionRequest) -> AgentFinding:
-        provider = RSSNewsProvider(max_items=5)
-        home_news = provider.fetch(request.home_team)
-        away_news = provider.fetch(request.away_team)
+    def __init__(self, search_settings: "SearchSettings | None" = None) -> None:
+        self.search_settings = search_settings
 
-        if not home_news.fetch_ok and not away_news.fetch_ok:
+    def analyze(self, request: MatchPredictionRequest) -> AgentFinding:
+        # Prefer the configured web-search layer (reachable from mainland China);
+        # fall back to the legacy RSS provider only if search is unavailable.
+        if self.search_settings and self.search_settings.enabled and self.search_settings.api_key:
+            return self._analyze_via_search(request)
+        return self._analyze_via_rss(request)
+
+    def _analyze_via_search(self, request: MatchPredictionRequest) -> AgentFinding:
+        from .search import WebSearchProvider
+
+        provider = WebSearchProvider(self.search_settings)
+        home = provider.search_sync(f"{request.home_team} 国家队 伤停 阵容 最新")
+        away = provider.search_sync(f"{request.away_team} 国家队 伤停 阵容 最新")
+
+        if not home.ok and not away.ok:
             return AgentFinding(
                 agent=self.name,
                 confidence=0.3,
                 signal="neutral",
-                rationale="新闻抓取失败或暂无可验证新闻，不调整概率。",
+                rationale=f"新闻搜索源不可用（{home.error or away.error}），本维度暂不调整概率。",
                 sources=[],
+                metrics={"search_ok": False},
+            )
+
+        home_injury = _has_injury_signal(home)
+        away_injury = _has_injury_signal(away)
+        signal, rationale, confidence = _injury_to_signal(
+            request, home_injury, away_injury, search=True
+        )
+        sources = [h.url for h in (home.hits + away.hits) if h.url][:5]
+        return AgentFinding(
+            agent=self.name,
+            confidence=confidence,
+            signal=signal,
+            rationale=rationale,
+            sources=sources,
+            metrics={
+                "search_ok": True,
+                "home_results": len(home.hits),
+                "away_results": len(away.hits),
+                "home_injury_signal": home_injury,
+                "away_injury_signal": away_injury,
+            },
+        )
+
+    def _analyze_via_rss(self, request: MatchPredictionRequest) -> AgentFinding:
+        provider = RSSNewsProvider(max_items=5)
+        home_news = provider.fetch(request.home_team)
+        away_news = provider.fetch(request.away_team)
+
+        if (not home_news.fetch_ok and not away_news.fetch_ok) or (
+            not home_news.items and not away_news.items
+        ):
+            return AgentFinding(
+                agent=self.name,
+                confidence=0.3,
+                signal="neutral",
+                rationale=(
+                    "未配置可用的新闻搜索源，且默认 RSS 源在当前网络下不可达，"
+                    "本维度暂不调整概率。可在系统设置里配置联网搜索 API。"
+                ),
+                sources=[],
+                metrics={"search_ok": False},
             )
 
         home_injury = home_news.injury_signal
         away_injury = away_news.injury_signal
-
-        if home_injury and not away_injury:
-            signal = "negative"
-            rationale = f"{request.home_team} 相关新闻出现伤停信号，可能削弱主队。"
-            confidence = 0.6
-        elif away_injury and not home_injury:
-            signal = "positive"
-            rationale = f"{request.away_team} 相关新闻出现伤停信号，客队可能减员。"
-            confidence = 0.6
-        elif home_injury and away_injury:
-            signal = "neutral"
-            rationale = "双方都有伤停信号，方向相互抵消，暂不单边调整。"
-            confidence = 0.5
-        else:
-            signal = "neutral"
-            rationale = "近期新闻未发现明确伤停信号，阵容状态暂按正常处理。"
-            confidence = 0.45
-
+        signal, rationale, confidence = _injury_to_signal(
+            request, home_injury, away_injury, search=False
+        )
         sources = [item.url for item in (home_news.items + away_news.items) if item.url][:5]
         return AgentFinding(
             agent=self.name,
@@ -88,6 +219,7 @@ class NewsSentimentAgent:
             rationale=rationale,
             sources=sources,
             metrics={
+                "search_ok": True,
                 "home_headlines": len(home_news.items),
                 "away_headlines": len(away_news.items),
                 "home_injury_signal": home_injury,
@@ -196,10 +328,12 @@ def template_explanation(result: PredictionResult) -> str:
 def build_agent_findings(
     request: MatchPredictionRequest,
     odds: OddsRecord | None,
+    store: "ForecastStore | None" = None,
+    search_settings: "SearchSettings | None" = None,
 ) -> list[AgentFinding]:
     return [
-        StrengthAgent().analyze(request),
-        FormAgent().analyze(request),
-        NewsSentimentAgent().analyze(request),
+        StrengthAgent(store).analyze(request),
+        FormAgent(store).analyze(request),
+        NewsSentimentAgent(search_settings).analyze(request),
         OddsMarketAgent().analyze(odds),
     ]
