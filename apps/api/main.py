@@ -441,6 +441,9 @@ async def predict_match_stream(request: MatchPredictionRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/predict/tournament", response_model=TournamentBracket)
 def predict_tournament(request: TournamentSimulationRequest):
     random.seed(42)
     elo_map = {**store.get_team_elo()}
