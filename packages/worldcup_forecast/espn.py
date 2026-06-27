@@ -89,17 +89,39 @@ def _safe_float(value: Any) -> float | None:
 
 
 class ESPNProvider:
-    async def fetch_scoreboard(self) -> list[ESPNMatch]:
+    async def fetch_scoreboard(self, date: str | None = None) -> list[ESPNMatch]:
+        """Fetch scoreboard for a given date (YYYYMMDD) or today if omitted."""
+        url = SCOREBOARD_URL
+        if date:
+            url = f"{SCOREBOARD_URL}?dates={date}"
         async with httpx.AsyncClient(timeout=15, headers=HEADERS, follow_redirects=True) as client:
-            resp = await client.get(SCOREBOARD_URL)
+            resp = await client.get(url)
             resp.raise_for_status()
             data = resp.json()
         events = data.get("events", [])
         return [ESPNMatch(e) for e in events]
 
     async def fetch_all_matches(self) -> list[ESPNMatch]:
-        """Fetch scoreboard; ESPN returns upcoming + live + recent matches."""
-        return await self.fetch_scoreboard()
+        """Fetch today's matches; if all are finished, also fetch tomorrow's.
+
+        ESPN's default scoreboard returns today's events. When every match has
+        completed we automatically pull the next calendar day so the UI always
+        shows upcoming fixtures rather than a stale completed list.
+        """
+        today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        matches = await self.fetch_scoreboard(date=today_str)
+
+        all_done = bool(matches) and all(m.completed for m in matches)
+        if all_done:
+            from datetime import timedelta
+            tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+            tomorrow_str = tomorrow.strftime("%Y%m%d")
+            next_matches = await self.fetch_scoreboard(date=tomorrow_str)
+            # Merge: keep today's results plus tomorrow's upcoming fixtures.
+            seen = {m.match_id for m in matches}
+            matches = matches + [m for m in next_matches if m.match_id not in seen]
+
+        return matches
 
     async def fetch_teams(self) -> list[dict[str, Any]]:
         async with httpx.AsyncClient(timeout=15, headers=HEADERS, follow_redirects=True) as client:
