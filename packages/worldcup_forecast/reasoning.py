@@ -49,10 +49,20 @@ def deterministic_steps(finding: AgentFinding) -> list[ReasoningStep]:
     """Build a reasoning trace from a finding's own data, without an LLM."""
     steps: list[ReasoningStep] = []
     if finding.metrics:
-        metric_text = "，".join(
-            f"{key}={value}" for key, value in finding.metrics.items()
-        )
-        steps.append(ReasoningStep(kind="observation", content=f"采集到的关键指标：{metric_text}。"))
+        # Only surface scalar values (int/float/bool/str); skip nested dicts/lists
+        # that would expose raw Python data structures to the user.
+        simple = {
+            k: v for k, v in finding.metrics.items()
+            if isinstance(v, (int, float, bool, str)) and k != "search_ok"
+        }
+        if simple:
+            metric_text = "，".join(
+                f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in simple.items()
+            )
+            steps.append(ReasoningStep(kind="observation", content=f"关键指标：{metric_text}。"))
+        else:
+            steps.append(ReasoningStep(kind="observation", content="已采集结构化数据，见分析说明。"))
     else:
         steps.append(ReasoningStep(kind="observation", content="本维度暂无结构化指标可观察。"))
     steps.append(ReasoningStep(kind="analysis", content=finding.rationale))

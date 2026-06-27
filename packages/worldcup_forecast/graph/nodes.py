@@ -15,10 +15,10 @@ if TYPE_CHECKING:
     from ..schemas import LLMSettings, SearchSettings
 
 _FINDING_SCHEMA = """{
-  "agent": "<角色名>",
+  "agent": "<必须使用下面指定的中文角色名，不得修改>",
   "confidence": 0.0-1.0,
   "signal": "positive|neutral|negative",
-  "rationale": "<一两句依据>",
+  "rationale": "<两三句中文分析依据，引用具体数字，不要暴露原始字段名或 Python dict>",
   "sources": ["<来源>"],
   "metrics": {}
 }"""
@@ -28,6 +28,8 @@ _AGENT_SYSTEM = (
     "使用提供的工具收集数据，然后输出一个 JSON 对象（无多余文字）：\n"
     + _FINDING_SCHEMA
     + "\nsignal 的判断依据：positive=利好主队，neutral=无明显倾向，negative=利好客队。"
+    "\n重要：agent 字段必须使用任务开头指定的中文角色名，不得使用英文或自行命名。"
+    "\nrationale 必须用自然中文写成，不得输出 Python dict、字段名或原始数据结构。"
 )
 
 
@@ -150,6 +152,7 @@ async def strength_node(state: dict) -> dict:
 
     tool_map = state["_tools"]
     task = (
+        f"角色名（必须原样填入 agent 字段）：实力分析员\n"
         f"分析 {req.home_team}（主场）vs {req.away_team}（客场）的实力对比。\n"
         f"请调用 query_elo 工具获取双方 Elo 评分，然后给出分析结论。"
     )
@@ -171,8 +174,9 @@ async def form_node(state: dict) -> dict:
 
     tool_map = state["_tools"]
     task = (
+        f"角色名（必须原样填入 agent 字段）：近期状态分析员\n"
         f"分析 {req.home_team} 和 {req.away_team} 的近期状态。\n"
-        f"请分别调用 get_recent_form 工具获取两队近10场数据，对比场均积分和净胜球，给出结论。"
+        f"请分别调用 get_recent_form 工具获取两队近10场数据，对比场均积分和净胜球，给出中文结论。"
     )
     finding = await _run_react_agent("近期状态分析员", task, [tool_map["get_recent_form"]], llm_settings)
     return {"agent_findings": [finding]}
@@ -195,8 +199,9 @@ async def news_node(state: dict) -> dict:
 
     tool_map = state["_tools"]
     task = (
+        f"角色名（必须原样填入 agent 字段）：新闻舆情分析员\n"
         f"搜索 {req.home_team} 和 {req.away_team} 的最新伤停、阵容消息。\n"
-        f"分别搜索两队，判断是否有影响比赛结果的伤停/缺阵信号，给出结论。"
+        f"分别搜索两队，判断是否有影响比赛结果的伤停/缺阵信号，给出中文结论。不要在 rationale 里输出原始字段名或数据结构。"
     )
     finding = await _run_react_agent("新闻舆情分析员", task, [tool_map["search_news"]], llm_settings)
     return {"agent_findings": [finding]}
@@ -217,8 +222,9 @@ async def odds_node(state: dict) -> dict:
 
     tool_map = state["_tools"]
     task = (
+        f"角色名（必须原样填入 agent 字段）：赔率市场分析员\n"
         f"获取 {req.home_team} vs {req.away_team} 的赔率数据。\n"
-        f"调用 get_odds 工具，分析胜/平/负赔率隐含的市场概率，给出结论。"
+        f"调用 get_odds 工具，分析胜/平/负赔率隐含的市场概率，给出中文结论。不要在 rationale 里输出原始字段名或数据结构。"
     )
     finding = await _run_react_agent("赔率市场分析员", task, [tool_map["get_odds"]], llm_settings)
     return {"agent_findings": [finding]}
